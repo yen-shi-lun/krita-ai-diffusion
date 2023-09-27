@@ -80,6 +80,14 @@ class Connection(QObject):
     def interrupt(self):
         eventloop.run(self.client.interrupt())
 
+    def refresh(self):
+        async def _refresh():
+            await self.client.refresh()
+            self.changed.emit()
+
+        if self.state is ConnectionState.connected:
+            eventloop.run(_refresh())
+
 
 def apply_performance_preset(settings: Settings, device: DeviceInfo):
     if settings.performance_preset is PerformancePreset.auto:
