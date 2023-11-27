@@ -27,14 +27,15 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 from PyQt5.QtGui import QColor, QFontMetrics, QGuiApplication, QKeyEvent, QMouseEvent, QPalette
-from PyQt5.QtCore import Qt, QSize, QUuid, pyqtSignal
+from PyQt5.QtCore import Qt, QMetaObject, QSize, QUuid, pyqtSignal
 from krita import Krita, DockWidget
 import krita
 
-from .. import Control, ControlMode, Server, Style, Styles, Bounds, client
+from .. import Control, ControlMode, Server, Style, Styles, Bounds, client, root
 from . import actions, EventSuppression, SettingsDialog, theme
-from .model import Model, ModelRegistry, Job, JobKind, JobQueue, State, Workspace
-from .connection import Connection, ConnectionState
+from ..properties import Binding, Bind, bind
+from ..model import Model, Job, JobKind, JobQueue, State, Workspace
+from ..connection import Connection, ConnectionState
 from ..image import Extent, Image
 from ..resources import UpscalerName
 from ..settings import ServerMode, settings
@@ -46,8 +47,12 @@ class QueueWidget(QToolButton):
         QToolButton {{ border: none; border-radius: 6px; background-color: {color}; color: white; }}
         QToolButton::menu-indicator {{ width: 0px; }}"""
 
+    _jobs: JobQueue
+
     def __init__(self, parent):
         super().__init__(parent)
+        self._jobs = JobQueue()
+        self._jobs.count_changed.connect(self._update)
 
         queue_menu = QMenu(self)
         queue_menu.addAction(self._create_action("Cancel active", actions.cancel_active))
@@ -60,7 +65,17 @@ class QueueWidget(QToolButton):
         self.setPopupMode(QToolButton.InstantPopup)
         self.setArrowType(Qt.ArrowType.NoArrow)
 
-    def update(self, jobs: JobQueue):
+    @property
+    def jobs(self):
+        return self._jobs
+
+    @jobs.setter
+    def jobs(self, jobs: JobQueue):
+        self._jobs.count_changed.disconnect(self._update)
+        self._jobs = jobs
+        self._jobs.count_changed.connect(self._update)
+
+    def _update(self, jobs: JobQueue):
         count = jobs.count(State.queued)
         if jobs.any_executing():
             self.setStyleSheet(self._style.format(color=theme.background_active))
@@ -85,10 +100,8 @@ class ControlWidget(QWidget):
     _model: Model
     _control: Control
 
-    def __init__(self, parent=None):
+    def __init__(self, model: Model, parent=None):
         super().__init__(parent)
-        model = Model.active()
-        assert model
         self._model = model
         self._control = Control(ControlMode.image, self._model.document.active_layer)  # type: ignore (CTRLLAYER)
 
@@ -233,7 +246,7 @@ class ControlWidget(QWidget):
                 self.layer_select.setEnabled(not has_active_job)
 
     def _check_is_installed(self):
-        connection = Connection.instance()
+        connection = root.connection
         is_installed = True
         mode = ControlMode(self.mode_select.currentData())
         if connection.state is ConnectionState.connected:
@@ -279,11 +292,13 @@ class ControlWidget(QWidget):
 
 class ControlListWidget(QWidget):
     _controls: List[ControlWidget]
+    _model: Model
 
     changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, model: Model, parent=None):
         super().__init__(parent)
+        self._model = model
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
@@ -291,10 +306,17 @@ class ControlListWidget(QWidget):
         self._controls = []
 
     def add(self):
-        model = Model.active()
-        assert model
-        model.control.append(Control(ControlMode.image, model.document.active_layer))  # type: ignore (CTRLLAYER)
-        self.value = model.control
+        self._model.control.append(Control(ControlMode.image, self._model.document.active_layer))  # type: ignore (CTRLLAYER)
+        self.value = self._model.control
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        self._model = model
+        self.value = self._model.control
 
     @property
     def value(self):
@@ -358,11 +380,16 @@ class ControlLayerButton(QToolButton):
 
 
 class HistoryWidget(QListWidget):
+    _jobs: JobQueue
+    _connections: list[QMetaObject.Connection]
     _last_prompt: Optional[str] = None
     _last_bounds: Optional[Bounds] = None
 
     def __init__(self, parent):
         super().__init__(parent)
+        self._jobs = JobQueue()
+        self._connections = []
+
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setResizeMode(QListView.Adjust)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -371,7 +398,25 @@ class HistoryWidget(QListWidget):
         self.setIconSize(QSize(96, 96))
         self.itemClicked.connect(self.handle_preview_click)
 
+    @property
+    def jobs(self):
+        return self._jobs
+
+    @jobs.setter
+    def jobs(self, jobs: JobQueue):
+        Binding.disconnect_all(self._connections)
+        self._jobs = jobs
+        self._connections = [
+            jobs.selection_changed.connect(self.update_selection),
+            self.itemSelectionChanged.connect(self.select_item),
+            jobs.job_finished.connect(self.add),
+        ]
+        self.rebuild()
+        self.update_selection()
+
     def add(self, job: Job):
+        if job.state is not State.finished or job.kind is not JobKind.diffusion:
+            return  # Only finished diffusion jobs have images to show
         if self._last_prompt != job.prompt or self._last_bounds != job.bounds:
             self._last_prompt = job.prompt
             self._last_bounds = job.bounds
@@ -399,6 +444,22 @@ class HistoryWidget(QListWidget):
         if scrollbar.isVisible() and scrollbar.value() >= scrollbar.maximum() - 4:
             self.scrollToBottom()
 
+    def update_selection(self):
+        selection = self._jobs.selection
+        if selection is None and len(self.selectedItems()) > 0:
+            self.clearSelection()
+        elif selection:
+            item = self._find(selection)
+            if item is not None and not item.isSelected():
+                item.setSelected(True)
+
+    def select_item(self):
+        items = self.selectedItems()
+        if len(items) > 0:
+            self._jobs.selection = self._item_data(items[0])
+        else:
+            self._jobs.selection = None
+
     def is_finished(self, job: Job):
         return job.kind is JobKind.diffusion and job.state is State.finished
 
@@ -407,9 +468,9 @@ class HistoryWidget(QListWidget):
         while self.count() > 0 and self.item(0).data(Qt.ItemDataRole.UserRole) != first_id:
             self.takeItem(0)
 
-    def rebuild(self, jobs: Iterable[Job]):
+    def rebuild(self):
         self.clear()
-        for job in filter(self.is_finished, jobs):
+        for job in filter(self.is_finished, self._jobs):
             self.add(job)
 
     def item_info(self, item: QListWidgetItem):
@@ -436,12 +497,21 @@ class HistoryWidget(QListWidget):
         )
         return super().mousePressEvent(e)
 
+    def _find(self, id: JobQueue.Item):
+        items = (self.item(i) for i in range(self.count()))
+        return next((item for item in items if self._item_data(item) == id), None)
+
+    def _item_data(self, item: QListWidgetItem):
+        return JobQueue.Item(
+            item.data(Qt.ItemDataRole.UserRole), item.data(Qt.ItemDataRole.UserRole + 1)
+        )
+
 
 class StyleSelectWidget(QWidget):
     _value: Style
     _styles: list[Style]
 
-    changed = pyqtSignal()
+    value_changed = pyqtSignal(Style)
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -464,10 +534,10 @@ class StyleSelectWidget(QWidget):
 
         Styles.list().changed.connect(self.update_styles)
         Styles.list().name_changed.connect(self.update_styles)
-        Connection.instance().changed.connect(self.update_styles)
+        root.connection.state_changed.connect(self.update_styles)
 
     def update_styles(self):
-        comfy = Connection.instance().client_if_connected
+        comfy = root.connection.client_if_connected
         self._styles = client.filter_supported_styles(Styles.list(), comfy)
         self._combo.blockSignals(True)
         self._combo.clear()
@@ -479,14 +549,14 @@ class StyleSelectWidget(QWidget):
         elif len(self._styles) > 0:
             self._value = self._styles[0]
             self._combo.setCurrentIndex(0)
-            self.changed.emit()
+            self.value_changed.emit(self._value)
         self._combo.blockSignals(False)
 
     def change_style(self):
         style = self._styles[self._combo.currentIndex()]
         if style != self._value:
             self._value = style
-            self.changed.emit()
+            self.value_changed.emit(style)
 
     def show_settings(self):
         SettingsDialog.instance().show(self._value)
@@ -541,7 +611,7 @@ class TextPromptWidget(QWidget):
     scrolls to the next line when eg. selecting and then looks like it's empty."""
 
     activated = pyqtSignal()
-    changed = pyqtSignal()
+    text_changed = pyqtSignal(str)
 
     _multi: MultiLineTextPromptWidget
     _single: QLineEdit
@@ -577,7 +647,7 @@ class TextPromptWidget(QWidget):
         self.is_negative = self._is_negative
 
     def notify_text_changed(self):
-        self.changed.emit()
+        self.text_changed.emit(self.text)
 
     def notify_activated(self):
         self.activated.emit()
@@ -628,6 +698,51 @@ class TextPromptWidget(QWidget):
             w.setPalette(palette)
 
 
+class StrengthWidget(QWidget):
+    value_changed = pyqtSignal(float)
+
+    def __init__(self, slider_range=(1, 100), parent=None):
+        super().__init__(parent)
+        self._layout = QHBoxLayout()
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(self._layout)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._slider.setMinimum(slider_range[0])
+        self._slider.setMaximum(slider_range[1])
+        self._slider.setSingleStep(5)
+        self._slider.valueChanged.connect(self.notify_changed)
+
+        self._input = QSpinBox(self)
+        self._input.setMinimum(1)
+        self._input.setMaximum(100)
+        self._input.setSingleStep(5)
+        self._input.setPrefix("Strength: ")
+        self._input.setSuffix("%")
+        self._input.valueChanged.connect(self.notify_changed)
+
+        self._layout.addWidget(self._slider)
+        self._layout.addWidget(self._input)
+
+    def notify_changed(self, value: int):
+        if self._slider.value() != value:
+            self._slider.setValue(value)
+        if self._input.value() != value:
+            self._input.setValue(value)
+        self.value_changed.emit(self.value)
+
+    @property
+    def value(self):
+        return self._slider.value() / 100
+
+    @value.setter
+    def value(self, value: float):
+        if value == self.value:
+            return
+        self._slider.setValue(int(value * 100))
+        self._input.setValue(int(value * 100))
+
+
 class WorkspaceSelectWidget(QToolButton):
     _icons = {
         Workspace.generation: theme.icon("workspace-generation"),
@@ -672,9 +787,11 @@ class WorkspaceSelectWidget(QToolButton):
 
 class GenerationWidget(QWidget):
     _model: Optional[Model] = None
+    _model_bindings: list[QMetaObject.Connection | Binding]
 
     def __init__(self):
         super().__init__()
+        self._model_bindings = []
         settings.changed.connect(self.update_settings)
 
         layout = QVBoxLayout(self)
@@ -682,9 +799,7 @@ class GenerationWidget(QWidget):
         self.setLayout(layout)
 
         self.workspace_select = WorkspaceSelectWidget(self)
-
         self.style_select = StyleSelectWidget(self)
-        self.style_select.changed.connect(self.change_style)
 
         style_layout = QHBoxLayout()
         style_layout.addWidget(self.workspace_select)
@@ -693,12 +808,10 @@ class GenerationWidget(QWidget):
 
         self.prompt_textbox = TextPromptWidget(parent=self)
         self.prompt_textbox.line_count = settings.prompt_line_count
-        self.prompt_textbox.changed.connect(self.change_prompt)
         self.prompt_textbox.activated.connect(self.generate)
 
         self.negative_textbox = TextPromptWidget(line_count=1, is_negative=True, parent=self)
         self.negative_textbox.setVisible(settings.show_negative_prompt)
-        self.negative_textbox.changed.connect(self.change_negative_prompt)
         self.negative_textbox.activated.connect(self.generate)
 
         prompt_layout = QVBoxLayout()
@@ -712,26 +825,13 @@ class GenerationWidget(QWidget):
         self.control_list.changed.connect(self.change_control)
         layout.addWidget(self.control_list)
 
-        self.strength_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.strength_slider.setMinimum(1)
-        self.strength_slider.setMaximum(100)
-        self.strength_slider.setSingleStep(5)
-        self.strength_slider.valueChanged.connect(self.change_strength)
-
-        self.strength_input = QSpinBox(self)
-        self.strength_input.setMinimum(1)
-        self.strength_input.setMaximum(100)
-        self.strength_input.setSingleStep(5)
-        self.strength_input.setPrefix("Strength: ")
-        self.strength_input.setSuffix("%")
-        self.strength_input.valueChanged.connect(self.change_strength)
+        self.strength_slider = StrengthWidget(parent=self)
 
         self.add_control_button = ControlLayerButton(self)
         self.add_control_button.clicked.connect(self.control_list.add)
 
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
-        strength_layout.addWidget(self.strength_input)
         strength_layout.addWidget(self.add_control_button)
         layout.addLayout(strength_layout)
 
@@ -776,19 +876,24 @@ class GenerationWidget(QWidget):
     @model.setter
     def model(self, model: Model):
         if self._model != model:
-            self.history.rebuild(model.history)
+            Binding.disconnect_all(self._model_bindings)
             self._model = model
+            self._model_bindings = [
+                bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
+                bind(model, "style", self.style_select, "value"),
+                bind(model, "prompt", self.prompt_textbox, "text"),
+                bind(model, "negative_prompt", self.negative_textbox, "text"),
+                bind(model, "strength", self.strength_slider, "value"),
+                model.progress_changed.connect(self.update_progress),
+                model.error_changed.connect(self.error_text.setText),
+                model.has_error_changed.connect(self.error_text.setVisible),
+            ]
+            self.queue_button.jobs = model.jobs
+            self.history.jobs = model.jobs
 
     def update(self):
         model = self.model
-        self.workspace_select.value = model.workspace
-        self.style_select.value = model.style
-        if self.style_select.value != model.style:
-            self.change_style()  # Model style is not in style list (filtered out)
-        self.prompt_textbox.text = model.prompt
-        self.negative_textbox.text = model.negative_prompt
         self.control_list.value = model.control
-        self.strength_input.setValue(int(model.strength * 100))
         self.error_text.setText(model.error)
         self.error_text.setVisible(model.error != "")
         self.apply_button.setEnabled(model.can_apply_result)
@@ -796,7 +901,6 @@ class GenerationWidget(QWidget):
 
     def update_progress(self):
         self.progress_bar.setValue(int(self.model.progress * 100))
-        self.queue_button.update(self.model.jobs)
 
     def update_settings(self, key: str, value):
         if key == "prompt_line_count":
@@ -808,32 +912,9 @@ class GenerationWidget(QWidget):
             self.control_list.update_control_field("end_spin", lambda x: x.setVisible(value))
             self.control_list.update_control_field("end_spin", lambda x: x.setValue(1.0))
 
-    def show_results(self, job: Job):
-        if job.kind is JobKind.diffusion:
-            self.history.prune(self.model.jobs)
-            self.history.add(job)
-
     def generate(self):
         self.model.generate()
         self.update()
-
-    def change_style(self):
-        if self._model:
-            self.model.style = self.style_select.value
-            self.control_list.notify_style_changed()
-
-    def change_prompt(self):
-        self.model.prompt = self.prompt_textbox.text
-
-    def change_negative_prompt(self):
-        self.model.negative_prompt = self.negative_textbox.text
-
-    def change_strength(self, value: int):
-        self.model.strength = value / 100
-        if self.strength_input.value() != value:
-            self.strength_input.setValue(value)
-        if self.strength_slider.value() != value:
-            self.strength_slider.setValue(value)
 
     def change_control(self):
         self.model.control = self.control_list.value
@@ -908,7 +989,7 @@ class UpscaleWidget(QWidget):
         self.refinement_checkbox.toggled.connect(self.change_refinement)
 
         self.style_select = StyleSelectWidget(self)
-        self.style_select.changed.connect(self.change_style)
+        self.style_select.value_changed.connect(self.change_style)
 
         self.strength_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.strength_slider.setMinimum(20)
@@ -986,7 +1067,7 @@ class UpscaleWidget(QWidget):
         self.update_progress()
 
     def update_models(self):
-        client = Connection.instance().client
+        client = root.connection.client
         self.model_select.blockSignals(True)
         self.model_select.clear()
         for file in client.upscalers:
@@ -1087,7 +1168,7 @@ class LiveWidget(QWidget):
         self.apply_button.clicked.connect(self.apply_result)
 
         self.style_select = StyleSelectWidget(self)
-        self.style_select.changed.connect(self.change_style)
+        self.style_select.value_changed.connect(self.change_style)
 
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.workspace_select)
@@ -1143,11 +1224,11 @@ class LiveWidget(QWidget):
         self.add_control_button.clicked.connect(self.control_list.add)
 
         self.prompt_textbox = TextPromptWidget(line_count=1, parent=self)
-        self.prompt_textbox.changed.connect(self.change_prompt)
+        self.prompt_textbox.text_changed.connect(self.change_prompt)
 
         self.negative_textbox = TextPromptWidget(line_count=1, is_negative=True, parent=self)
         self.negative_textbox.setVisible(settings.show_negative_prompt)
-        self.negative_textbox.changed.connect(self.change_negative_prompt)
+        self.negative_textbox.text_changed.connect(self.change_negative_prompt)
 
         prompt_layout = QVBoxLayout()
         prompt_layout.setContentsMargins(0, 0, 0, 0)
@@ -1179,9 +1260,9 @@ class LiveWidget(QWidget):
     @model.setter
     def model(self, model: Model):
         if self._model:
-            self._model.job_finished.disconnect(self.handle_job_finished)
+            self._model.jobs.job_finished.disconnect(self.handle_job_finished)
         self._model = model
-        self._model.job_finished.connect(self.handle_job_finished)
+        self._model.jobs.job_finished.connect(self.handle_job_finished)
 
     def update(self):
         self.workspace_select.value = self.model.workspace
@@ -1290,11 +1371,11 @@ class WelcomeWidget(QWidget):
 
         layout.addStretch()
 
-        Connection.instance().changed.connect(self.update)
+        root.connection.state_changed.connect(self.update)
         self.update()
 
     def update(self):
-        connection = Connection.instance()
+        connection = root.connection
         if connection.state in [ConnectionState.disconnected, ConnectionState.error]:
             self._connect_status.setText("Not connected to server.")
         if connection.state is ConnectionState.error:
@@ -1327,12 +1408,10 @@ class WelcomeWidget(QWidget):
 
 
 class ImageDiffusionWidget(DockWidget):
-    _server: Server = ...  # type: ignore (injected in extension.py)
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Image Generation")
-        self._welcome = WelcomeWidget(self._server)
+        self._welcome = WelcomeWidget(root.server)
         self._generation = GenerationWidget()
         self._upscaling = UpscaleWidget()
         self._live = LiveWidget()
@@ -1343,20 +1422,18 @@ class ImageDiffusionWidget(DockWidget):
         self._frame.addWidget(self._live)
         self.setWidget(self._frame)
 
-        Connection.instance().changed.connect(self.update)
-        ModelRegistry.instance().created.connect(self.register_model)
+        root.connection.state_changed.connect(self.update)
+        root.model_created.connect(self.register_model)
 
     def canvasChanged(self, canvas):
         self.update()
 
-    def register_model(self, model):
-        model.changed.connect(self.update)
-        model.job_finished.connect(self._generation.show_results)
-        model.progress_changed.connect(self.update_progress)
+    def register_model(self, model: Model):
+        model.workspace_changed.connect(self.update)
 
     def update(self):
-        model = Model.active()
-        connection = Connection.instance()
+        model = root.model_for_active_document()
+        connection = root.connection
         if model is None or connection.state in [
             ConnectionState.disconnected,
             ConnectionState.connecting,
@@ -1365,20 +1442,10 @@ class ImageDiffusionWidget(DockWidget):
             self._frame.setCurrentWidget(self._welcome)
         elif model.workspace is Workspace.generation:
             self._generation.model = model
-            self._generation.update()
             self._frame.setCurrentWidget(self._generation)
         elif model.workspace is Workspace.upscaling:
             self._upscaling.model = model
-            self._upscaling.update()
             self._frame.setCurrentWidget(self._upscaling)
         elif model.workspace is Workspace.live:
             self._live.model = model
-            self._live.update()
             self._frame.setCurrentWidget(self._live)
-
-    def update_progress(self):
-        if model := Model.active():
-            if model.workspace is Workspace.generation:
-                self._generation.update_progress()
-            elif model.workspace is Workspace.upscaling:
-                self._upscaling.update_progress()

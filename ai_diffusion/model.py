@@ -4,16 +4,17 @@ from collections import deque
 from copy import copy
 from datetime import datetime
 from enum import Enum, Flag
-from typing import Deque, Optional, cast
+from typing import Deque, NamedTuple, Optional, cast
 from PyQt5.QtCore import Qt, QObject, pyqtSignal
 
-from .. import eventloop, Document, workflow, NetworkError, client, settings, util
-from ..image import Image, ImageCollection, Mask, Bounds
-from ..client import ClientMessage, ClientEvent
-from ..pose import Pose
-from ..style import Style, Styles
-from ..workflow import Control, ControlMode, Conditioning, LiveParams
+from . import eventloop, Document, workflow, NetworkError, client, settings, util
+from .image import Image, ImageCollection, Mask, Bounds
+from .client import ClientMessage, ClientEvent, filter_supported_styles
+from .pose import Pose
+from .style import Style, Styles
+from .workflow import Control, ControlMode, Conditioning, LiveParams
 from .connection import Connection, ConnectionState
+from .properties import Property, PropertyMeta
 import krita
 
 
@@ -63,11 +64,23 @@ class Job:
         return self._results
 
 
-class JobQueue:
+class JobQueue(QObject):
+    """Queue of waiting, ongoing and finished jobs for one document."""
+
+    class Item(NamedTuple):
+        job: str
+        image: int
+
+    count_changed = pyqtSignal()
+    selection_changed = pyqtSignal()
+    job_finished = pyqtSignal(Job)
+
     _entries: Deque[Job]
+    _selection: Item | None = None
     _memory_usage = 0  # in MB
 
     def __init__(self):
+        super().__init__()
         self._entries = deque()
 
     def add(self, id: str, prompt: str, bounds: Bounds):
@@ -115,6 +128,9 @@ class JobQueue:
             discarded = self._entries.popleft()
             self._memory_usage -= discarded._results.size / (1024**2)
 
+    def select(self, job_id: str, index: int):
+        self.selection = self.Item(job_id, index)
+
     def any_executing(self):
         return any(j.state is State.executing for j in self._entries)
 
@@ -128,6 +144,15 @@ class JobQueue:
         return iter(self._entries)
 
     @property
+    def selection(self):
+        return self._selection
+
+    @selection.setter
+    def selection(self, value: Item | None):
+        self._selection = value
+        self.selection_changed.emit()
+
+    @property
     def memory_usage(self):
         return self._memory_usage
 
@@ -138,49 +163,50 @@ class Workspace(Enum):
     live = 2
 
 
-class Model(QObject):
-    """View-model for diffusion workflows on a Krita document. Stores all inputs related to
+class Model(QObject, metaclass=PropertyMeta):
+    """Represents diffusion workflows for a specific Krita document. Stores all inputs related to
     image generation. Launches generation jobs. Listens to server messages and keeps a
     list of finished, currently running and enqueued jobs.
     """
 
     _doc: Document
+    _connection: Connection
     _layer: Optional[krita.Node] = None
     _live_result: Optional[Image] = None
 
-    changed = pyqtSignal()
-    job_finished = pyqtSignal(Job)
-    progress_changed = pyqtSignal()
+    # changed = pyqtSignal()
+    # job_finished = pyqtSignal(Job)
+    has_error_changed = pyqtSignal(bool)
 
-    workspace = Workspace.generation
-    style: Style
-    prompt = ""
-    negative_prompt = ""
+    workspace = Property(Workspace.generation, setter="set_workspace")
+    style = Property(Styles.list().default)
+    prompt = Property("")
+    negative_prompt = Property("")
     control: list[Control]
-    strength = 1.0
+    strength = Property(1.0)
     upscale: UpscaleParams
     live: LiveParams
-    progress = 0.0
+    progress = Property(0.0)
     jobs: JobQueue
-    error = ""
+    error = Property("")
+
     task: Optional[asyncio.Task] = None
 
-    def __init__(self, document: Document):
+    def __init__(self, document: Document, connection: Connection):
         super().__init__()
         self._doc = document
-        styles = client.filter_supported_styles(
-            Styles.list(), Connection.instance().client_if_connected
-        )
-        self.style = styles[0] if len(styles) > 0 else Styles.list().default
+        self._connection = connection
         self.control = []
         self.upscale = UpscaleParams(self)
         self.live = LiveParams()
         self.jobs = JobQueue()
 
-    @staticmethod
-    def active():
-        """Return the model for the currently active document."""
-        return ModelRegistry.instance().model_for_active_document()
+        self.jobs.job_finished.connect(self.update_preview)
+        self.error_changed.connect(lambda: self.has_error_changed.emit(self.has_error))
+
+        if client := connection.client_if_connected:
+            self.style = next(iter(filter_supported_styles(Styles.list(), client)), self.style)
+            self.upscale.upscaler = client.default_upscaler
 
     def generate(self):
         """Enqueue image generation for the current setup."""
@@ -220,11 +246,10 @@ class Model(QObject):
         image: Optional[Image],
         mask: Optional[Mask],
     ):
-        client = Connection.instance().client
+        client = self._connection.client
         style, strength = self.style, self.strength
         if not self.jobs.any_executing():
             self.progress = 0.0
-            self.changed.emit()
 
         if mask is not None:
             mask_bounds_rel = Bounds(  # mask bounds relative to cropped image
@@ -248,7 +273,6 @@ class Model(QObject):
 
         job_id = await client.enqueue(job)
         self.jobs.add(job_id, conditioning.prompt, bounds)
-        self.changed.emit()
 
     def upscale_image(self):
         image = self._doc.get_image(Bounds(0, 0, *self._doc.extent))
@@ -259,7 +283,7 @@ class Model(QObject):
         )
 
     async def _upscale_image(self, job: Job, image: Image, params: UpscaleParams):
-        client = Connection.instance().client
+        client = self._connection.client
         if params.upscaler == "":
             params.upscaler = client.default_upscaler
         if params.use_diffusion:
@@ -270,7 +294,6 @@ class Model(QObject):
             work = workflow.upscale_simple(client, image, params.upscaler, params.factor)
         job.id = await client.enqueue(work)
         self._doc.resize(params.target_extent)
-        self.changed.emit()
 
     def generate_live(self):
         bounds = Bounds(0, 0, *self._doc.extent)
@@ -286,13 +309,12 @@ class Model(QObject):
         )
 
     async def _generate_live(self, job: Job, image: Image | None, style: Style, cond: Conditioning):
-        client = Connection.instance().client
+        client = self._connection.client
         if image:
             work = workflow.refine(client, style, image, cond, self.live.strength, self.live)
         else:
             work = workflow.generate(client, style, self._doc.extent, cond, self.live)
         job.id = await client.enqueue(work)
-        self.changed.emit()
 
     def _get_current_image(self, bounds: Bounds):
         exclude = [  # exclude control layers from projection
@@ -327,38 +349,33 @@ class Model(QObject):
         )
 
     async def _generate_control_layer(self, job: Job, image: Image, mode: ControlMode):
-        client = Connection.instance().client
+        client = self._connection.client
         work = workflow.create_control_image(image, mode)
         job.id = await client.enqueue(work)
-        self.changed.emit()
 
     def remove_control_layer(self, control: Control):
         self.control.remove(control)
-        self.changed.emit()
 
     def cancel(self, active=False, queued=False):
         if queued:
             to_remove = [job for job in self.jobs if job.state is State.queued]
             if len(to_remove) > 0:
-                Connection.instance().clear_queue()
+                self._connection.clear_queue()
                 for job in to_remove:
                     self.jobs.remove(job)
         if active and self.jobs.any_executing():
-            Connection.instance().interrupt()
+            self._connection.interrupt()
 
     def report_progress(self, value):
         self.progress = value
-        self.progress_changed.emit()
 
     def report_error(self, message: str):
         self.error = message
         self.live.is_active = False
-        self.changed.emit()
 
     def clear_error(self):
         if self.error != "":
             self.error = ""
-            self.changed.emit()
 
     def handle_message(self, message: ClientMessage):
         job = self.jobs.find(message.job_id)
@@ -374,9 +391,7 @@ class Model(QObject):
             self.progress = 1
             if message.images:
                 self.jobs.set_results(job, message.images)
-            if job.kind is JobKind.diffusion and self._layer is None and job.id:
-                self.show_preview(job.id, 0)
-            elif job.kind is JobKind.control_layer:
+            if job.kind is JobKind.control_layer:
                 job.control.image = self.add_control_layer(job, message.result)  # type: ignore
             elif job.kind is JobKind.upscaling:
                 self.add_upscale_layer(job)
@@ -384,14 +399,21 @@ class Model(QObject):
                 self._live_result = job.results[0]
             if job.kind is not JobKind.diffusion:
                 self.jobs.remove(job)
-            self.job_finished.emit(job)
-            self.changed.emit()
+            self.jobs.job_finished.emit(job)
+            if job.kind is JobKind.diffusion and self._layer is None and job.id:
+                self.jobs.select(job.id, 0)
         elif message.event is ClientEvent.interrupted:
             job.state = State.cancelled
             self.report_progress(0)
         elif message.event is ClientEvent.error:
             job.state = State.cancelled
             self.report_error(f"Server execution error: {message.error}")
+
+    def update_preview(self):
+        if selection := self.jobs.selection:
+            self.show_preview(selection.job, selection.image)
+        else:
+            self.hide_preview()
 
     def show_preview(self, job_id: str, index: int, name_prefix="Preview"):
         job = self.jobs.find(job_id)
@@ -405,12 +427,10 @@ class Model(QObject):
         else:
             self._layer = self._doc.insert_layer(name, job.results[index], job.bounds)
             self._layer.setLocked(True)
-        self.changed.emit()
 
     def hide_preview(self):
         if self._layer is not None:
             self._doc.hide_layer(self._layer)
-            self.changed.emit()
 
     def apply_current_result(self):
         """Promote the preview layer to a user layer."""
@@ -418,7 +438,6 @@ class Model(QObject):
         self._layer.setLocked(False)
         self._layer.setName(self._layer.name().replace("[Preview]", "[Generated]"))
         self._layer = None
-        self.changed.emit()
 
     def add_control_layer(self, job: Job, result: Optional[dict]):
         assert job.kind is JobKind.control_layer and job.control
@@ -444,6 +463,12 @@ class Model(QObject):
             f"[Live] {self.prompt}", self._live_result, Bounds(0, 0, *self._doc.extent)
         )
 
+    def set_workspace(self, workspace: Workspace):
+        if self.workspace is Workspace.live:
+            self.live.is_active = False
+        self._workspace = workspace
+        self.workspace_changed.emit(workspace)
+
     @property
     def history(self):
         return (job for job in self.jobs if job.state is State.finished)
@@ -455,6 +480,10 @@ class Model(QObject):
     @property
     def has_live_result(self):
         return self._live_result is not None
+
+    @property
+    def has_error(self):
+        return self.error != ""
 
     @property
     def document(self):
@@ -470,7 +499,7 @@ class Model(QObject):
 
 
 class UpscaleParams:
-    upscaler: str
+    upscaler = ""
     factor = 2.0
     use_diffusion = True
     strength = 0.3
@@ -479,104 +508,11 @@ class UpscaleParams:
 
     def __init__(self, model: Model):
         self._model = model
-        if client := Connection.instance().client_if_connected:
-            self.upscaler = client.default_upscaler
-        else:
-            self.upscaler = ""
+        # if client := Connection.instance().client_if_connected:
+        #     self.upscaler = client.default_upscaler
+        # else:
+        #     self.upscaler = ""
 
     @property
     def target_extent(self):
         return self._model.document.extent * self.factor
-
-
-class ModelRegistry(QObject):
-    """Singleton that keeps track of all models (one per open image document) and notifies
-    widgets when new ones are created."""
-
-    _instance = None
-    _models: list[Model] = []
-    _task: Optional[asyncio.Task] = None
-
-    created = pyqtSignal(Model)
-
-    def __init__(self):
-        super().__init__()
-        connection = Connection.instance()
-
-        def handle_messages():
-            if self._task is None and connection.state is ConnectionState.connected:
-                self._task = eventloop._loop.create_task(self._handle_messages())
-            elif self._task and connection.state is ConnectionState.disconnected:
-                assert self._task.done()
-                self._task = None
-
-        connection.changed.connect(handle_messages)
-
-    def __del__(self):
-        if self._task is not None:
-            self._task.cancel()
-
-    @classmethod
-    def instance(cls):
-        if cls._instance is None:
-            cls._instance = ModelRegistry()
-        return cls._instance
-
-    def model_for_active_document(self):
-        # Remove models for documents that have been closed
-        self._models = [m for m in self._models if m.is_valid]
-
-        # Find or create model for active document
-        if doc := Document.active():
-            model = next((m for m in self._models if m.is_active), None)
-            if model is None:
-                model = Model(doc)
-                self._models.append(model)
-                self.created.emit(model)
-            return model
-
-        return None
-
-    async def stop_listening(self):
-        if self._task is not None:
-            self._task.cancel()
-            await self._task
-
-    def report_error(self, message: str):
-        for m in self._models:
-            m.report_error(message)
-
-    def clear_error(self):
-        for m in self._models:
-            m.clear_error()
-
-    def _find_model(self, job_id: str) -> Optional[Model]:
-        return next((m for m in self._models if m.jobs.find(job_id)), None)
-
-    async def _handle_messages(self):
-        client = Connection.instance().client
-        temporary_disconnect = False
-
-        try:
-            async for msg in client.listen():
-                try:
-                    if msg.event is ClientEvent.error and not msg.job_id:
-                        self.report_error(f"Error communicating with server: {msg.error}")
-                    elif msg.event is ClientEvent.disconnected:
-                        temporary_disconnect = True
-                        self.report_error("Disconnected from server, trying to reconnect...")
-                    elif msg.event is ClientEvent.connected:
-                        if temporary_disconnect:
-                            temporary_disconnect = False
-                            self.clear_error()
-                    else:
-                        model = self._find_model(msg.job_id)
-                        if model is not None:
-                            model.handle_message(msg)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    util.client_logger.exception(e)
-                    self.report_error(f"Error handling server message: {str(e)}")
-        except asyncio.CancelledError:
-            pass  # shutdown
