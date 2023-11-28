@@ -33,8 +33,8 @@ import krita
 
 from .. import Control, ControlMode, Server, Style, Styles, Bounds, client, root
 from . import actions, EventSuppression, SettingsDialog, theme
-from ..properties import Binding, Bind, bind
-from ..model import Model, Job, JobKind, JobQueue, State, Workspace
+from ..properties import Binding, Bind, bind, bind_combo, bind_widget
+from ..model import Model, Job, JobKind, JobQueue, State, Workspace, ControlLayer, ControlLayerList
 from ..connection import Connection, ConnectionState
 from ..image import Extent, Image
 from ..resources import UpscalerName
@@ -95,15 +95,13 @@ class QueueWidget(QToolButton):
 
 
 class ControlWidget(QWidget):
-    changed = pyqtSignal()
-
     _model: Model
-    _control: Control
+    _control: ControlLayer
 
-    def __init__(self, model: Model, parent=None):
+    def __init__(self, model: Model, control: ControlLayer, parent=None):
         super().__init__(parent)
         self._model = model
-        self._control = Control(ControlMode.image, self._model.document.active_layer)  # type: ignore (CTRLLAYER)
+        self._control = control
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -115,22 +113,27 @@ class ControlWidget(QWidget):
         )
         for mode in (m for m in ControlMode if m is not ControlMode.inpaint):
             icon = theme.icon(f"control-{mode.name}")
-            self.mode_select.addItem(icon, mode.text, mode.value)
-        self.mode_select.currentIndexChanged.connect(self._notify)
-        self.mode_select.currentIndexChanged.connect(self.update_installed_packages)
+            self.mode_select.addItem(icon, mode.text, mode)
+        bind_combo(control, "mode", self.mode_select)
 
         self.layer_select = QComboBox(self)
-        self.layer_select.currentIndexChanged.connect(self._notify)
         self.layer_select.setMinimumContentsLength(20)
         self.layer_select.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
         )
+        self._update_layers()
+        bind_combo(control, "layer_id", self.layer_select)
+        self._model.image_layers.changed.connect(self._update_layers)
+        control.has_active_job_changed.connect(lambda x: self.layer_select.setEnabled(not x))
+        control.is_supported_changed.connect(self.layer_select.setVisible)
 
         self.generate_button = QToolButton(self)
         self.generate_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.generate_button.setIcon(theme.icon("control-generate"))
         self.generate_button.setToolTip("Generate control layer from current image")
         self.generate_button.clicked.connect(self.generate)
+        control.can_generate_changed.connect(self.generate_button.setVisible)
+        control.has_active_job_changed.connect(lambda x: self.generate_button.setEnabled(not x))
 
         self.add_pose_button = QToolButton(self)
         self.add_pose_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
@@ -138,28 +141,32 @@ class ControlWidget(QWidget):
         self.add_pose_button.setToolTip("Add new character pose to selected layer")
         self.add_pose_button.setVisible(False)
         self.add_pose_button.clicked.connect(self._add_pose_character)
+        control.is_pose_vector_changed.connect(self.add_pose_button.setVisible)
 
         self.strength_spin = QSpinBox(self)
         self.strength_spin.setRange(0, 100)
-        self.strength_spin.setValue(100)
+        self.strength_spin.setValue(int(control.strength * 100))
         self.strength_spin.setSuffix("%")
         self.strength_spin.setSingleStep(10)
         self.strength_spin.setToolTip("Control strength")
-        self.strength_spin.valueChanged.connect(self._notify)
+        self.strength_spin.valueChanged.connect(lambda x: setattr(control, "strength", x / 100))
+        control.strength_changed.connect(lambda x: self.strength_spin.setValue(int(x * 100)))
 
         self.end_spin = QDoubleSpinBox(self)
         self.end_spin.setRange(0.0, 1.0)
-        self.end_spin.setValue(1.0)
-        self.end_spin.setSuffix("")
+        self.end_spin.setValue(control.end)
         self.end_spin.setSingleStep(0.1)
         self.end_spin.setToolTip("Control ending step ratio")
-        self.end_spin.valueChanged.connect(self._notify)
         self.end_spin.setVisible(settings.show_control_end)
+        bind_widget(control, "end", self.end_spin.valueChanged, self.end_spin.setValue)
+        # TODO: hook up to settings
 
         self.error_text = QLabel(self)
         self.error_text.setText("ControlNet not installed")
         self.error_text.setStyleSheet(f"color: {theme.red};")
         self.error_text.setVisible(False)
+        control.is_supported_changed.connect(lambda x: self.error_text.setVisible(not x))
+        control.error_text_changed.connect(self.error_text.setText)
 
         self.remove_button = QToolButton(self)
         self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
@@ -179,135 +186,49 @@ class ControlWidget(QWidget):
         layout.addWidget(self.error_text, 1)
         layout.addWidget(self.remove_button)
 
-        self.value = Control(ControlMode.scribble, self._model.document.active_layer, 1)  # type: ignore (CTRLLAYER)
-
-        # non-exhaustive list of actions that create/remove layers
-        Krita.instance().action("add_new_paint_layer").triggered.connect(self.update_layers)
-        Krita.instance().action("duplicatelayer").triggered.connect(self.update_layers)
-        Krita.instance().action("remove_layer").triggered.connect(self.update_layers)
-
-    _suppress_changes = EventSuppression()
-
-    def _notify(self):
-        if not self._suppress_changes:
-            self._control.mode = ControlMode(self.mode_select.currentData())
-            id = self.layer_select.currentData()
-            self._control.image = self._model.document.find_layer(id)  # type: ignore (CTRLLAYER)
-            self._control.strength = self.strength_spin.value() / 100
-            self._control.end = self.end_spin.value()
-            self.changed.emit()
-
-    def update_and_select_layer(self, id: QUuid):
-        layers = reversed(self._model.document.image_layers)
-        self.layer_select.clear()
-        index = -1
-        for layer in layers:
-            self.layer_select.addItem(layer.name(), layer.uniqueId())
-            if layer.uniqueId() == id:
-                index = self.layer_select.count() - 1
-        if index == -1 and self.value in self._model.control:
-            self.remove()
-        else:
-            self.layer_select.setCurrentIndex(index)
-
-    def update_layers(self):
-        with self._suppress_changes:
-            self.update_and_select_layer(self.layer_select.currentData())
+    def _update_layers(self):
+        layers: reversed[krita.Node] = reversed(self._model.image_layers)
+        self.layer_select.blockSignals(True)
+        try:
+            self.layer_select.clear()
+            index = -1
+            for layer in layers:
+                self.layer_select.addItem(layer.name(), layer.uniqueId())
+                if layer.uniqueId() == self._control.layer_id:
+                    index = self.layer_select.count() - 1
+            if index == -1 and self._control in self._model.control:
+                self.remove()
+            else:
+                self.layer_select.setCurrentIndex(index)
+        finally:
+            self.layer_select.blockSignals(False)
 
     def generate(self):
-        self._model.generate_control_layer(self.value)
-        self.generate_button.setEnabled(False)
-        self.layer_select.setEnabled(False)
+        self._control.generate()
 
     def remove(self):
-        self._model.remove_control_layer(self.value)
+        self._model.control.remove(self._control)
 
     def _add_pose_character(self):
-        self._model.document.add_pose_character(self.value.image)  # type: ignore (CTRLLAYER)
-
-    @property
-    def value(self):
-        return self._control
-
-    @value.setter
-    def value(self, control: Control):
-        changed = self._control != control
-        self._control = copy(control)
-        with self._suppress_changes:
-            if changed:
-                self.update_and_select_layer(control.image.uniqueId())  # type: ignore (CTRLLAYER)
-                self.mode_select.setCurrentIndex(self.mode_select.findData(control.mode.value))
-                self.strength_spin.setValue(int(control.strength * 100))
-                self.end_spin.setValue(float(control.end))
-            if self._check_is_installed():
-                active_job = self._model.jobs.find(control)
-                has_active_job = active_job and active_job.state is not State.finished
-                self.generate_button.setEnabled(not has_active_job)
-                self.layer_select.setEnabled(not has_active_job)
-
-    def _check_is_installed(self):
-        connection = root.connection
-        is_installed = True
-        mode = ControlMode(self.mode_select.currentData())
-        if connection.state is ConnectionState.connected:
-            sdver = client.resolve_sd_version(self._model.style, connection.client)
-            if mode is ControlMode.image:
-                if connection.client.ip_adapter_model[sdver] is None:
-                    self.error_text.setToolTip(f"The server is missing ip-adapter_sdxl_vit-h.bin")
-                    is_installed = False
-            elif connection.client.control_model[mode][sdver] is None:
-                filenames = mode.filenames(sdver)
-                if filenames:
-                    self.error_text.setToolTip(f"The server is missing {filenames}")
-                else:
-                    self.error_text.setText(f"Not supported for {sdver.value}")
-                is_installed = False
-        self.error_text.setVisible(False)  # Avoid layout resize
-        self.layer_select.setVisible(is_installed)
-        self.generate_button.setVisible(
-            is_installed and mode not in [ControlMode.image, ControlMode.stencil]
-        )
-        self.add_pose_button.setVisible(is_installed and mode is ControlMode.pose)
-        self.add_pose_button.setEnabled(self._is_vector_layer())
-        self.strength_spin.setVisible(is_installed)
-        self.strength_spin.setEnabled(self._is_first_image_mode())
-        self.end_spin.setVisible(
-            is_installed and settings.show_control_end and mode is not ControlMode.image
-        )
-        self.end_spin.setEnabled(self._is_first_image_mode())
-        self.error_text.setVisible(not is_installed)
-        return is_installed
-
-    def update_installed_packages(self):
-        _ = self._check_is_installed()
-
-    def _is_first_image_mode(self):
-        return self._control.mode is not ControlMode.image or self._control == next(
-            (c for c in self._model.control if c.mode is ControlMode.image), None
-        )
-
-    def _is_vector_layer(self):
-        return isinstance(self.value.image, krita.Node) and self.value.image.type() == "vectorlayer"
+        self._model.document.add_pose_character(self._control.layer_id)
 
 
 class ControlListWidget(QWidget):
     _controls: List[ControlWidget]
     _model: Model
+    _model_connections: list[QMetaObject.Connection]
 
     changed = pyqtSignal()
 
     def __init__(self, model: Model, parent=None):
         super().__init__(parent)
         self._model = model
+        self._controls = []
+        self._model_connections = []
+
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
-
-        self._controls = []
-
-    def add(self):
-        self._model.control.append(Control(ControlMode.image, self._model.document.active_layer))  # type: ignore (CTRLLAYER)
-        self.value = self._model.control
 
     @property
     def model(self):
@@ -315,30 +236,17 @@ class ControlListWidget(QWidget):
 
     @model.setter
     def model(self, model: Model):
-        self._model = model
-        self.value = self._model.control
-
-    @property
-    def value(self):
-        # Filter out controls whose layer has been deleted
-        result, removed = [], []
-        for control in self._controls:
-            c = control.value
-            removed.append(control) if c.image is None else result.append(c)
-        for control in removed:
-            self._remove_widget(control)
-        return result
-
-    @value.setter
-    def value(self, controls: List[Control]):
-        with self._suppress_changes:
-            if len(controls) != len(self._controls):
-                while len(self._controls) > len(controls):
-                    self._remove_widget(self._controls[0])
-                while len(self._controls) < len(controls):
-                    self._add_widget()
-            for control, widget in zip(controls, self._controls):
-                widget.value = control
+        if self._model != model:
+            Binding.disconnect_all(self._model_connections)
+            self._model = model
+            while len(self._controls) > 0:
+                self._remove_widget(self._controls[0])
+            for control in self._model.control:
+                self._add_widget(control)
+            self._model_connections = [
+                model.control.added.connect(self._add_widget),
+                model.control.removed.connect(self._remove_widget),
+            ]
 
     def notify_style_changed(self):
         for control in self._controls:
@@ -350,22 +258,16 @@ class ControlListWidget(QWidget):
         if not self._suppress_changes:
             self.changed.emit()
 
-    def _add_widget(self):
-        control = ControlWidget(self)
-        control.changed.connect(self._notify)
-        self._controls.append(control)
-        self._layout.addWidget(control)
-        return control
+    def _add_widget(self, control: ControlLayer):
+        widget = ControlWidget(self._model, control, self)
+        self._controls.append(widget)
+        self._layout.addWidget(widget)
 
-    def _remove_widget(self, control: ControlWidget):
-        self._controls.remove(control)
-        control.deleteLater()
-
-    def update_control_field(self, name, function):
-        for control in self._controls:
-            setting = getattr(control, name, None)
-            if setting is not None:
-                function(setting)
+    def _remove_widget(self, widget: ControlWidget | ControlLayer):
+        if isinstance(widget, ControlLayer):
+            widget = next(w for w in self._controls if w._control == widget)
+        self._controls.remove(widget)
+        widget.deleteLater()
 
 
 class ControlLayerButton(QToolButton):
@@ -786,11 +688,12 @@ class WorkspaceSelectWidget(QToolButton):
 
 
 class GenerationWidget(QWidget):
-    _model: Optional[Model] = None
+    _model: Model
     _model_bindings: list[QMetaObject.Connection | Binding]
 
     def __init__(self):
         super().__init__()
+        self._model = root.active_model
         self._model_bindings = []
         settings.changed.connect(self.update_settings)
 
@@ -822,13 +725,11 @@ class GenerationWidget(QWidget):
         layout.addLayout(prompt_layout)
 
         self.control_list = ControlListWidget(self)
-        self.control_list.changed.connect(self.change_control)
         layout.addWidget(self.control_list)
 
         self.strength_slider = StrengthWidget(parent=self)
 
         self.add_control_button = ControlLayerButton(self)
-        self.add_control_button.clicked.connect(self.control_list.add)
 
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
@@ -860,7 +761,6 @@ class GenerationWidget(QWidget):
         layout.addWidget(self.error_text)
 
         self.history = HistoryWidget(self)
-        self.history.itemSelectionChanged.connect(self.select_preview)
         self.history.itemDoubleClicked.connect(self.apply_result)
         layout.addWidget(self.history)
 
@@ -870,7 +770,6 @@ class GenerationWidget(QWidget):
 
     @property
     def model(self):
-        assert self._model is not None
         return self._model
 
     @model.setter
@@ -887,17 +786,12 @@ class GenerationWidget(QWidget):
                 model.progress_changed.connect(self.update_progress),
                 model.error_changed.connect(self.error_text.setText),
                 model.has_error_changed.connect(self.error_text.setVisible),
+                model.can_apply_result_changed.connect(self.apply_button.setEnabled),
+                self.add_control_button.clicked.connect(model.control.add),
             ]
+            self.control_list.model = model
             self.queue_button.jobs = model.jobs
             self.history.jobs = model.jobs
-
-    def update(self):
-        model = self.model
-        self.control_list.value = model.control
-        self.error_text.setText(model.error)
-        self.error_text.setVisible(model.error != "")
-        self.apply_button.setEnabled(model.can_apply_result)
-        self.update_progress()
 
     def update_progress(self):
         self.progress_bar.setValue(int(self.model.progress * 100))
@@ -916,19 +810,9 @@ class GenerationWidget(QWidget):
         self.model.generate()
         self.update()
 
-    def change_control(self):
-        self.model.control = self.control_list.value
-
     def show_preview(self, item: QListWidgetItem):
         job_id, index = self.history.item_info(item)
         self.model.show_preview(job_id, index)
-
-    def select_preview(self):
-        items = self.history.selectedItems()
-        if len(items) > 0:
-            self.show_preview(items[0])
-        else:
-            self.model.hide_preview()
 
     def apply_selected_result(self):
         self.model.apply_current_result()
@@ -939,10 +823,12 @@ class GenerationWidget(QWidget):
 
 
 class UpscaleWidget(QWidget):
-    _model: Optional[Model] = None
+    _model: Model
 
     def __init__(self):
         super().__init__()
+        self._model = root.active_model
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 2, 4, 0)
         self.setLayout(layout)
@@ -1044,7 +930,6 @@ class UpscaleWidget(QWidget):
 
     @property
     def model(self):
-        assert self._model is not None
         return self._model
 
     @model.setter
@@ -1140,10 +1025,11 @@ class LiveWidget(QWidget):
     _play_icon = theme.icon("play")
     _pause_icon = theme.icon("pause")
 
-    _model: Optional[Model] = None
+    _model: Model
 
     def __init__(self):
         super().__init__()
+        self._model = root.active_model
         settings.changed.connect(self.update_settings)
 
         layout = QVBoxLayout(self)
@@ -1221,7 +1107,7 @@ class LiveWidget(QWidget):
         self.control_list.changed.connect(self.change_control)
 
         self.add_control_button = ControlLayerButton(self)
-        self.add_control_button.clicked.connect(self.control_list.add)
+        self.add_control_button.clicked.connect(self.model.control.add)
 
         self.prompt_textbox = TextPromptWidget(line_count=1, parent=self)
         self.prompt_textbox.text_changed.connect(self.change_prompt)
@@ -1254,7 +1140,6 @@ class LiveWidget(QWidget):
 
     @property
     def model(self):
-        assert self._model is not None
         return self._model
 
     @model.setter

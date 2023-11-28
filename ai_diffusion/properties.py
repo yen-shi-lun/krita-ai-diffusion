@@ -2,6 +2,7 @@ from enum import Enum
 from typing import NamedTuple, Sequence, TypeVar, Generic, cast
 
 from PyQt5.QtCore import QObject, QMetaObject, pyqtSignal, pyqtBoundSignal, pyqtProperty  # type: ignore
+from PyQt5.QtWidgets import QComboBox
 
 
 T = TypeVar("T")
@@ -104,6 +105,31 @@ def bind(model, model_property: str, widget, widget_property: str, mode=Bind.two
     else:
         # widget change -> update model
         widget_to_model = _signal(widget, widget_property).connect(_setter(model, model_property))
+        return Binding(model_to_widget, widget_to_model)
+
+
+def bind_widget(model, model_property: str, widget_signal: pyqtBoundSignal, widget_setter):
+    model_to_widget = _signal(model, model_property).connect(widget_setter)
+    widget_setter(getattr(model, model_property))
+    widget_to_model = widget_signal.connect(_setter(model, model_property))
+    return Binding(model_to_widget, widget_to_model)
+
+
+def bind_combo(model, model_property: str, combo: QComboBox, mode=Bind.two_way):
+    def set_combo(value):
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def set_model(index):
+        setattr(model, model_property, combo.currentData())
+
+    model_to_widget = _signal(model, model_property).connect(set_combo)
+    set_combo(getattr(model, model_property))
+    if mode is Bind.one_way:
+        return model_to_widget
+    else:
+        widget_to_model = combo.currentIndexChanged.connect(set_model)
         return Binding(model_to_widget, widget_to_model)
 
 
