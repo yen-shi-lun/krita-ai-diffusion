@@ -992,9 +992,7 @@ class PerformanceSettings(SettingsTab):
             )
 
     def _read(self):
-        memory_usage = 0
-        if model := Model.active():
-            memory_usage = model.jobs.memory_usage
+        memory_usage = root.active_model.jobs.memory_usage
         self._history_size.setValue(settings.history_size)
         self._history_usage.setText(f"Currently using {memory_usage:.1f} MB")
         self._batch_size.value = settings.batch_size

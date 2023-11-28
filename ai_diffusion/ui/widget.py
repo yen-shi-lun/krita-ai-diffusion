@@ -64,6 +64,7 @@ class QueueWidget(QToolButton):
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.setPopupMode(QToolButton.InstantPopup)
         self.setArrowType(Qt.ArrowType.NoArrow)
+        self._update()
 
     @property
     def jobs(self):
@@ -75,9 +76,9 @@ class QueueWidget(QToolButton):
         self._jobs = jobs
         self._jobs.count_changed.connect(self._update)
 
-    def _update(self, jobs: JobQueue):
-        count = jobs.count(State.queued)
-        if jobs.any_executing():
+    def _update(self):
+        count = self._jobs.count(State.queued)
+        if self._jobs.any_executing():
             self.setStyleSheet(self._style.format(color=theme.background_active))
             if count > 0:
                 self.setToolTip(f"Generating image. {count} jobs queued - click to cancel.")
@@ -125,23 +126,19 @@ class ControlWidget(QWidget):
         bind_combo(control, "layer_id", self.layer_select)
         self._model.image_layers.changed.connect(self._update_layers)
         control.has_active_job_changed.connect(lambda x: self.layer_select.setEnabled(not x))
-        control.is_supported_changed.connect(self.layer_select.setVisible)
 
         self.generate_button = QToolButton(self)
         self.generate_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.generate_button.setIcon(theme.icon("control-generate"))
         self.generate_button.setToolTip("Generate control layer from current image")
         self.generate_button.clicked.connect(self.generate)
-        control.can_generate_changed.connect(self.generate_button.setVisible)
         control.has_active_job_changed.connect(lambda x: self.generate_button.setEnabled(not x))
 
         self.add_pose_button = QToolButton(self)
         self.add_pose_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.add_pose_button.setIcon(theme.icon("add-pose"))
         self.add_pose_button.setToolTip("Add new character pose to selected layer")
-        self.add_pose_button.setVisible(False)
         self.add_pose_button.clicked.connect(self._add_pose_character)
-        control.is_pose_vector_changed.connect(self.add_pose_button.setVisible)
 
         self.strength_spin = QSpinBox(self)
         self.strength_spin.setRange(0, 100)
@@ -157,16 +154,13 @@ class ControlWidget(QWidget):
         self.end_spin.setValue(control.end)
         self.end_spin.setSingleStep(0.1)
         self.end_spin.setToolTip("Control ending step ratio")
-        self.end_spin.setVisible(settings.show_control_end)
         bind_widget(control, "end", self.end_spin.valueChanged, self.end_spin.setValue)
-        # TODO: hook up to settings
 
         self.error_text = QLabel(self)
-        self.error_text.setText("ControlNet not installed")
         self.error_text.setStyleSheet(f"color: {theme.red};")
-        self.error_text.setVisible(False)
-        control.is_supported_changed.connect(lambda x: self.error_text.setVisible(not x))
-        control.error_text_changed.connect(self.error_text.setText)
+        self.error_text.setVisible(not control.is_supported)
+        control.error_text_changed.connect(self._set_error)
+        self._set_error(control.error_text)
 
         self.remove_button = QToolButton(self)
         self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
@@ -185,6 +179,12 @@ class ControlWidget(QWidget):
         layout.addWidget(self.end_spin)
         layout.addWidget(self.error_text, 1)
         layout.addWidget(self.remove_button)
+
+        control.is_supported_changed.connect(self._update_visibility)
+        control.can_generate_changed.connect(self._update_visibility)
+        control.show_end_changed.connect(self._update_visibility)
+        control.is_pose_vector_changed.connect(self._update_visibility)
+        self._update_visibility()
 
     def _update_layers(self):
         layers: reversed[krita.Node] = reversed(self._model.image_layers)
@@ -211,6 +211,30 @@ class ControlWidget(QWidget):
 
     def _add_pose_character(self):
         self._model.document.add_pose_character(self._control.layer_id)
+
+    def _update_visibility(self):
+        def controls():
+            self.layer_select.setVisible(self._control.is_supported)
+            self.generate_button.setVisible(self._control.can_generate)
+            self.add_pose_button.setVisible(self._control.is_pose_vector)
+            self.strength_spin.setVisible(self._control.is_supported)
+            self.end_spin.setVisible(self._control.show_end)
+
+        def error():
+            self.error_text.setVisible(not self._control.is_supported)
+
+        if self._control.is_supported:
+            error()
+            controls()
+        else:  # always hide things to hide first to make space in the layout
+            controls()
+            error()
+
+    def _set_error(self, error: str):
+        parts = error.split("[", 2)
+        self.error_text.setText(parts[0])
+        if len(parts) > 1:
+            self.error_text.setToolTip(f"Missing one of the following models: {parts[1][:-1]}")
 
 
 class ControlListWidget(QWidget):
@@ -802,9 +826,6 @@ class GenerationWidget(QWidget):
         elif key == "show_negative_prompt":
             self.negative_textbox.text = ""
             self.negative_textbox.setVisible(value)
-        elif key == "show_control_end":
-            self.control_list.update_control_field("end_spin", lambda x: x.setVisible(value))
-            self.control_list.update_control_field("end_spin", lambda x: x.setValue(1.0))
 
     def generate(self):
         self.model.generate()

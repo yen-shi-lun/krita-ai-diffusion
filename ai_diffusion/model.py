@@ -76,28 +76,31 @@ class JobQueue(QObject):
         self._entries = deque()
 
     def add(self, id: str, prompt: str, bounds: Bounds):
-        self._entries.append(Job(id, JobKind.diffusion, prompt, bounds))
+        self._add(Job(id, JobKind.diffusion, prompt, bounds))
 
     def add_control(self, control: ControlLayer, bounds: Bounds):
         job = Job(None, JobKind.control_layer, f"[Control] {control.mode.text}", bounds)
         job.control = control
-        self._entries.append(job)
-        return job
+        return self._add(job)
 
     def add_upscale(self, bounds: Bounds):
         job = Job(None, JobKind.upscaling, f"[Upscale] {bounds.width}x{bounds.height}", bounds)
-        self._entries.append(job)
-        return job
+        return self._add(job)
 
     def add_live(self, prompt: str, bounds: Bounds):
         job = Job(None, JobKind.live_preview, prompt, bounds)
+        return self._add(job)
+
+    def _add(self, job: Job):
         self._entries.append(job)
+        self.count_changed.emit()
         return job
 
     def remove(self, job: Job):
         # Diffusion jobs: kept for history, pruned according to meomry usage
         # Control layer jobs: removed immediately once finished
         self._entries.remove(job)
+        self.count_changed.emit()
 
     def find(self, id: str):
         return next((j for j in self._entries if j.id == id), None)
@@ -110,6 +113,15 @@ class JobQueue(QObject):
         if job.kind is JobKind.diffusion:
             self._memory_usage += results.size / (1024**2)
             self.prune(keep=job)
+
+    def notify_started(self, job: Job):
+        job.state = State.executing
+        self.count_changed.emit()
+
+    def notify_finished(self, job: Job):
+        job.state = State.finished
+        self.job_finished.emit(job)
+        self.count_changed.emit()
 
     def prune(self, keep: Job):
         while self._memory_usage > settings.history_size and self._entries[0] != keep:
@@ -160,6 +172,7 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
     is_pose_vector = Property(False)
     can_generate = Property(True)
     has_active_job = Property(False)
+    show_end = Property(False)
     error_text = Property("")
 
     _model: Model
@@ -181,6 +194,7 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
         self.mode_changed.connect(self._update_is_pose_vector)
         self.layer_id_changed.connect(self._update_is_pose_vector)
         model.jobs.job_finished.connect(self._update_active_job)
+        settings.changed.connect(self._handle_settings)
 
     @property
     def layer(self):
@@ -214,12 +228,13 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
             elif client.control_model[self.mode][sdver] is None:
                 filenames = self.mode.filenames(sdver)
                 if filenames:
-                    self.error_text = f"The server is missing {filenames}"
+                    self.error_text = f"The ControlNet model is not installed {filenames}"
                 else:
                     self.error_text = f"Not supported for {sdver.value}"
                 is_supported = False
 
         self.is_supported = is_supported
+        self.show_end = self.is_supported and settings.show_control_end
         self.can_generate = is_supported and self.mode not in [
             ControlMode.image,
             ControlMode.stencil,
@@ -233,6 +248,10 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
         if self.has_active_job and not active:
             self._job = None  # job done
         self.has_active_job = active
+
+    def _handle_settings(self, name: str, value: object):
+        if name == "show_control_end":
+            self.show_end = self.is_supported and settings.show_control_end
 
 
 class ControlLayerList(QObject):
@@ -494,11 +513,9 @@ class Model(QObject, metaclass=PropertyMeta):
             return
 
         if message.event is ClientEvent.progress:
-            job.state = State.executing
+            self.jobs.notify_started(job)
             self.report_progress(message.progress)
         elif message.event is ClientEvent.finished:
-            job.state = State.finished
-            self.progress = 1
             if message.images:
                 self.jobs.set_results(job, message.images)
             if job.kind is JobKind.control_layer:
@@ -508,10 +525,11 @@ class Model(QObject, metaclass=PropertyMeta):
                 self.add_upscale_layer(job)
             elif job.kind is JobKind.live_preview and len(job.results) > 0:
                 self._live_result = job.results[0]
+            self.progress = 1
+            self.jobs.notify_finished(job)
             if job.kind is not JobKind.diffusion:
                 self.jobs.remove(job)
-            self.jobs.job_finished.emit(job)
-            if job.kind is JobKind.diffusion and self._layer is None and job.id:
+            elif job.kind is JobKind.diffusion and self._layer is None and job.id:
                 self.jobs.select(job.id, 0)
         elif message.event is ClientEvent.interrupted:
             job.state = State.cancelled
