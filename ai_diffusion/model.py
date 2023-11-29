@@ -4,11 +4,12 @@ from collections import deque
 from copy import copy
 from datetime import datetime
 from enum import Enum, Flag
+import random
 from typing import Deque, NamedTuple, Optional, cast
 from PyQt5.QtCore import Qt, QObject, QUuid, pyqtSignal
 
 from . import eventloop, workflow, NetworkError, settings, util
-from .image import Image, ImageCollection, Mask, Bounds
+from .image import Extent, Image, ImageCollection, Mask, Bounds
 from .client import ClientMessage, ClientEvent, filter_supported_styles, resolve_sd_version
 from .document import Document, LayerObserver
 from .pose import Pose
@@ -321,8 +322,8 @@ class Model(QObject, metaclass=PropertyMeta):
     negative_prompt = Property("")
     control: ControlLayerList
     strength = Property(1.0)
-    upscale: UpscaleParams
-    live: LiveParams
+    upscale: UpscaleWorkspace
+    live: LiveWorkspace
     progress = Property(0.0)
     jobs: JobQueue
     error = Property("")
@@ -335,10 +336,10 @@ class Model(QObject, metaclass=PropertyMeta):
         self._doc = document
         self._image_layers = document.create_layer_observer()
         self._connection = connection
-        self.control = ControlLayerList(self)
-        self.upscale = UpscaleParams(self)
-        self.live = LiveParams()
         self.jobs = JobQueue()
+        self.control = ControlLayerList(self)
+        self.upscale = UpscaleWorkspace(self)
+        self.live = LiveWorkspace(self)
 
         self.jobs.job_finished.connect(self.update_preview)
         self.jobs.selection_changed.connect(self.update_preview)
@@ -419,16 +420,15 @@ class Model(QObject, metaclass=PropertyMeta):
         job = self.jobs.add_upscale(Bounds(0, 0, *self.upscale.target_extent))
         self.clear_error()
         self.task = eventloop.run(
-            _report_errors(self, self._upscale_image(job, image, copy(self.upscale)))
+            _report_errors(self, self._upscale_image(job, image, self.upscale.params))
         )
 
     async def _upscale_image(self, job: Job, image: Image, params: UpscaleParams):
         client = self._connection.client
-        if params.upscaler == "":
-            params.upscaler = client.default_upscaler
+        upscaler = params.upscaler or client.default_upscaler
         if params.use_diffusion:
             work = workflow.upscale_tiled(
-                client, image, params.upscaler, params.factor, self.style, params.strength
+                client, image, upscaler, params.factor, self.style, params.strength
             )
         else:
             work = workflow.upscale_simple(client, image, params.upscaler, params.factor)
@@ -444,16 +444,15 @@ class Model(QObject, metaclass=PropertyMeta):
         cond = Conditioning(self.prompt, self.negative_prompt, control)
         job = self.jobs.add_live(self.prompt, bounds)
         self.clear_error()
-        self.task = eventloop.run(
-            _report_errors(self, self._generate_live(job, image, self.style, cond))
-        )
+        self.task = eventloop.run(_report_errors(self, self._generate_live(job, image, cond)))
 
-    async def _generate_live(self, job: Job, image: Image | None, style: Style, cond: Conditioning):
+    async def _generate_live(self, job: Job, image: Image | None, cond: Conditioning):
+        style, strength, params = self.style, self.live.strength, self.live.params
         client = self._connection.client
         if image:
-            work = workflow.refine(client, style, image, cond, self.live.strength, self.live)
+            work = workflow.refine(client, style, image, cond, strength, params)
         else:
-            work = workflow.generate(client, style, self._doc.extent, cond, self.live)
+            work = workflow.generate(client, style, self._doc.extent, cond, params)
         job.id = await client.enqueue(work)
 
     def _get_current_image(self, bounds: Bounds):
@@ -523,8 +522,6 @@ class Model(QObject, metaclass=PropertyMeta):
                 job.control.layer_id = self.add_control_layer(job, message.result).uniqueId()
             elif job.kind is JobKind.upscaling:
                 self.add_upscale_layer(job)
-            elif job.kind is JobKind.live_preview and len(job.results) > 0:
-                self._live_result = job.results[0]
             self.progress = 1
             self.jobs.notify_finished(job)
             if job.kind is not JobKind.diffusion:
@@ -629,24 +626,91 @@ class Model(QObject, metaclass=PropertyMeta):
         return self._doc.is_valid
 
 
-class UpscaleParams:
-    upscaler = ""
-    factor = 2.0
-    use_diffusion = True
-    strength = 0.3
+class UpscaleParams(NamedTuple):
+    upscaler: str
+    factor: float
+    use_diffusion: bool
+    strength: float
+    target_extent: Extent
+
+
+class UpscaleWorkspace(QObject, metaclass=PropertyMeta):
+    upscaler = Property("")
+    factor = Property(2.0)
+    use_diffusion = Property(True)
+    strength = Property(0.3)
+    target_extent = Property(Extent(1, 1))
 
     _model: Model
 
     def __init__(self, model: Model):
+        super().__init__()
         self._model = model
-        # if client := Connection.instance().client_if_connected:
-        #     self.upscaler = client.default_upscaler
-        # else:
-        #     self.upscaler = ""
+        if client := model._connection.client_if_connected:
+            self.upscaler = client.default_upscaler
+        self.factor_changed.connect(self._update_target_extent)
+
+    def _update_target_extent(self):
+        return self._model.document.extent * self.factor
 
     @property
-    def target_extent(self):
-        return self._model.document.extent * self.factor
+    def params(self):
+        return UpscaleParams(
+            upscaler=self.upscaler,
+            factor=self.factor,
+            use_diffusion=self.use_diffusion,
+            strength=self.strength,
+            target_extent=self.target_extent,
+        )
+
+
+class LiveWorkspace(QObject, metaclass=PropertyMeta):
+    is_active = Property(False, setter="toggle")
+    strength = Property(0.3)
+    seed = Property(0)
+    has_result = Property(False)
+
+    result_available = pyqtSignal(Image)
+
+    _model: Model
+    _result: Image | None = None
+
+    def __init__(self, model: Model):
+        super().__init__()
+        self._model = model
+        self.generate_seed()
+        model.jobs.job_finished.connect(self.handle_job_finished)
+
+    def generate_seed(self):
+        self.seed = random.randint(0, 2**31 - 1)
+
+    def toggle(self, active: bool):
+        if active != self.is_active:
+            self._is_active = active
+            self.is_active_changed.emit(active)
+            if active:
+                self._model.generate_live()
+
+    def handle_job_finished(self, job: Job):
+        if job.kind is JobKind.live_preview:
+            if len(job.results) > 0:
+                self.result = job.results[0]
+            if self.is_active:
+                self._model.generate_live()
+
+    @property
+    def result(self):
+        return self._result
+
+    @result.setter
+    def result(self, value: Image):
+        self._result = value
+        self.result_available.emit(value)
+        self.has_result = True
+
+    @property
+    def params(self):
+        return LiveParams(is_active=self.is_active, seed=self.seed)
 
 
 async def _report_errors(parent, coro):

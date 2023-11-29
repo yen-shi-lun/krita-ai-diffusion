@@ -1,5 +1,5 @@
 from __future__ import annotations
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject
 from PyQt5.QtGui import QGuiApplication, QPalette, QIcon, QPixmap, QFontMetrics
 from PyQt5.QtWidgets import QVBoxLayout, QLabel
 from pathlib import Path
@@ -75,3 +75,14 @@ class EventSuppression:
 
     def __bool__(self):
         return self.active
+
+
+class SignalBlocker:
+    def __init__(self, obj: QObject):
+        self._obj = obj
+
+    def __enter__(self):
+        self._obj.blockSignals(True)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._obj.blockSignals(False)
