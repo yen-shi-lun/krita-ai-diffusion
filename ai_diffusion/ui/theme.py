@@ -63,20 +63,6 @@ def set_text_clipped(label: QLabel, text: str):
     label.setText(elided)
 
 
-class EventSuppression:
-    def __init__(self):
-        self.active = False
-
-    def __enter__(self):
-        self.active = True
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.active = False
-
-    def __bool__(self):
-        return self.active
-
-
 class SignalBlocker:
     def __init__(self, obj: QObject):
         self._obj = obj

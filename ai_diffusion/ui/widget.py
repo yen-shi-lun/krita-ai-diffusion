@@ -32,7 +32,7 @@ from krita import Krita, DockWidget
 import krita
 
 from .. import Control, ControlMode, Server, Style, Styles, Bounds, client, root
-from . import actions, EventSuppression, SignalBlocker, SettingsDialog, theme
+from . import actions, SignalBlocker, SettingsDialog, theme
 from ..properties import Binding, Bind, bind, bind_combo, bind_widget
 from ..model import Model, Job, JobKind, JobQueue, State, Workspace, ControlLayer, ControlLayerList
 from ..connection import Connection, ConnectionState
@@ -99,7 +99,7 @@ class ControlWidget(QWidget):
     _model: Model
     _control: ControlLayer
 
-    def __init__(self, model: Model, control: ControlLayer, parent=None):
+    def __init__(self, model: Model, control: ControlLayer, parent: ControlListWidget):
         super().__init__(parent)
         self._model = model
         self._control = control
@@ -131,7 +131,7 @@ class ControlWidget(QWidget):
         self.generate_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.generate_button.setIcon(theme.icon("control-generate"))
         self.generate_button.setToolTip("Generate control layer from current image")
-        self.generate_button.clicked.connect(self.generate)
+        self.generate_button.clicked.connect(control.generate)
         control.has_active_job_changed.connect(lambda x: self.generate_button.setEnabled(not x))
 
         self.add_pose_button = QToolButton(self)
@@ -188,8 +188,7 @@ class ControlWidget(QWidget):
 
     def _update_layers(self):
         layers: reversed[krita.Node] = reversed(self._model.image_layers)
-        self.layer_select.blockSignals(True)
-        try:
+        with SignalBlocker(self.layer_select):
             self.layer_select.clear()
             index = -1
             for layer in layers:
@@ -200,17 +199,12 @@ class ControlWidget(QWidget):
                 self.remove()
             else:
                 self.layer_select.setCurrentIndex(index)
-        finally:
-            self.layer_select.blockSignals(False)
-
-    def generate(self):
-        self._control.generate()
 
     def remove(self):
         self._model.control.remove(self._control)
 
     def _add_pose_character(self):
-        self._model.document.add_pose_character(self._control.layer_id)
+        self._model.document.add_pose_character(self._control.layer)
 
     def _update_visibility(self):
         def controls():
@@ -271,16 +265,6 @@ class ControlListWidget(QWidget):
                 model.control.added.connect(self._add_widget),
                 model.control.removed.connect(self._remove_widget),
             ]
-
-    def notify_style_changed(self):
-        for control in self._controls:
-            control.update_installed_packages()
-
-    _suppress_changes = EventSuppression()
-
-    def _notify(self):
-        if not self._suppress_changes:
-            self.changed.emit()
 
     def _add_widget(self, control: ControlLayer):
         widget = ControlWidget(self._model, control, self)
@@ -1136,22 +1120,6 @@ class LiveWidget(QWidget):
                 model.live.result_available.connect(self.show_result),
             ]
             self.control_list.model = model
-
-    def update(self):
-        self.workspace_select.value = self.model.workspace
-        self.active_button.setIcon(
-            self._pause_icon if self.model.live.is_active else self._play_icon
-        )
-        self.apply_button.setEnabled(self.model.has_live_result)
-        self.style_select.value = self.model.style
-        self.strength_input.setValue(int(self.model.live.strength * 100))
-        self.strength_slider.setValue(int(self.model.live.strength * 100))
-        self.seed_input.setValue(self.model.live.seed)
-        self.prompt_textbox.text = self.model.prompt
-        self.negative_textbox.text = self.model.negative_prompt
-        self.control_list.value = self.model.control
-        self.error_text.setText(self.model.error)
-        self.error_text.setVisible(self.model.error != "")
 
     def update_settings(self, key: str, value):
         if key == "show_negative_prompt":

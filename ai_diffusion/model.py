@@ -649,12 +649,14 @@ class UpscaleWorkspace(QObject, metaclass=PropertyMeta):
         if client := model._connection.client_if_connected:
             self.upscaler = client.default_upscaler
         self.factor_changed.connect(self._update_target_extent)
+        self._update_target_extent()
 
     def _update_target_extent(self):
-        return self._model.document.extent * self.factor
+        self.target_extent = self._model.document.extent * self.factor
 
     @property
     def params(self):
+        self._update_target_extent()
         return UpscaleParams(
             upscaler=self.upscaler,
             factor=self.factor,

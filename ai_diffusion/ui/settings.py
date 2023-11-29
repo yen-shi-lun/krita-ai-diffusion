@@ -560,6 +560,7 @@ class ConnectionSettings(SettingsTab):
         self._layout.addWidget(info_external)
         self._layout.addWidget(self._server_stack)
 
+        root.connection.state_changed.connect(self.update_server_status)
         self.update_server_status()
 
     @property
@@ -1023,7 +1024,7 @@ class SettingsDialog(QDialog):
         assert cls._instance is not None
         return cls._instance
 
-    def __init__(self, main_window: QMainWindow, server: Server):
+    def __init__(self, server: Server):
         super().__init__()
         type(self)._instance = self
 
