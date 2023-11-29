@@ -34,7 +34,8 @@ import krita
 from .. import Control, ControlMode, Server, Style, Styles, Bounds, client, root
 from . import actions, SignalBlocker, SettingsDialog, theme
 from ..properties import Binding, Bind, bind, bind_combo, bind_widget
-from ..model import Model, Job, JobKind, JobQueue, State, Workspace, ControlLayer, ControlLayerList
+from ..jobs import Job, JobKind, JobState, JobQueue
+from ..model import Model, Workspace, ControlLayer, ControlLayerList
 from ..connection import Connection, ConnectionState
 from ..image import Extent, Image
 from ..resources import UpscalerName
@@ -77,7 +78,7 @@ class QueueWidget(QToolButton):
         self._jobs.count_changed.connect(self._update)
 
     def _update(self):
-        count = self._jobs.count(State.queued)
+        count = self._jobs.count(JobState.queued)
         if self._jobs.any_executing():
             self.setStyleSheet(self._style.format(color=theme.background_active))
             if count > 0:
@@ -325,7 +326,7 @@ class HistoryWidget(QListWidget):
         self.update_selection()
 
     def add(self, job: Job):
-        if job.state is not State.finished or job.kind is not JobKind.diffusion:
+        if job.state is not JobState.finished or job.kind is not JobKind.diffusion:
             return  # Only finished diffusion jobs have images to show
         if self._last_prompt != job.prompt or self._last_bounds != job.bounds:
             self._last_prompt = job.prompt
@@ -371,7 +372,7 @@ class HistoryWidget(QListWidget):
             self._jobs.selection = None
 
     def is_finished(self, job: Job):
-        return job.kind is JobKind.diffusion and job.state is State.finished
+        return job.kind is JobKind.diffusion and job.state is JobState.finished
 
     def prune(self, jobs: JobQueue):
         first_id = next((job.id for job in jobs if self.is_finished(job)), None)

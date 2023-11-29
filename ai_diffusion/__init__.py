@@ -28,7 +28,7 @@ from . import network, workflow
 if importlib.util.find_spec("krita"):
     from .document import Document
     from .connection import Connection, ConnectionState
-    from .model import Model, State, Workspace
+    from .model import Model, Workspace
     from .root import Root, root
     from .ui import ImageDiffusionWidget, SettingsDialog
     from .extension import AIToolsExtension
