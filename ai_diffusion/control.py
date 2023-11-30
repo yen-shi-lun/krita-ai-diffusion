@@ -102,7 +102,7 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
         self.is_pose_vector = self.mode is ControlMode.pose and self.layer.type() == "vectorlayer"
 
     def _update_active_job(self):
-        from jobs import JobState
+        from .jobs import JobState
 
         active = not (self._generate_job is None or self._generate_job.state is JobState.finished)
         if self.has_active_job and not active:

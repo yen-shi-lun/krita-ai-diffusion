@@ -91,10 +91,11 @@ class Bind(Enum):
 
 def bind(model, model_property: str, widget, widget_property: str, mode=Bind.two_way):
     # model change -> update widget
-    model_to_widget = _signal(model, model_property).connect(_setter(widget, widget_property))
+    widget_setter = _setter(widget, widget_property)
+    model_to_widget = _signal(model, model_property).connect(widget_setter)
 
     # set initial value from model
-    setattr(widget, widget_property, getattr(model, model_property))
+    widget_setter(getattr(model, model_property))
 
     if mode is Bind.one_way:
         return model_to_widget
@@ -122,7 +123,7 @@ def bind_combo(model, model_property: str, combo: QComboBox, mode=Bind.two_way):
         return Binding(model_to_widget, widget_to_model)
 
 
-def _signal(inst, property: str):
+def _signal(inst, property: str) -> pyqtBoundSignal:
     if hasattr(inst, f"{property}_changed"):
         return getattr(inst, f"{property}_changed")
     else:
@@ -130,13 +131,11 @@ def _signal(inst, property: str):
 
 
 def _setter(inst, property: str):
-    def _set_py(value):
+    def set_py(value):
         setattr(inst, property, value)
 
-    def _set_qt(value):
-        getattr(inst, f"set{property.capitalize()}")(value)
-
-    if hasattr(inst, property):
-        return _set_py
+    qt_setter_name = f"set{property.capitalize()}"
+    if hasattr(inst, qt_setter_name):
+        return getattr(inst, qt_setter_name)
     else:
-        return _set_qt
+        return set_py

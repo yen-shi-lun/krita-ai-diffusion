@@ -36,7 +36,6 @@ class Model(QObject, metaclass=PropertyMeta):
     _doc: Document
     _connection: Connection
     _layer: krita.Node | None = None
-    _live_result: Image | None = None
     _image_layers: LayerObserver
 
     workspace = Property(Workspace.generation, setter="set_workspace")
@@ -185,9 +184,7 @@ class Model(QObject, metaclass=PropertyMeta):
 
     def _get_current_image(self, bounds: Bounds):
         exclude = [  # exclude control layers from projection
-            cast(krita.Node, c.image)
-            for c in self.control
-            if c.mode not in [ControlMode.image, ControlMode.blur]
+            c.layer for c in self.control if c.mode not in [ControlMode.image, ControlMode.blur]
         ]
         if self._layer:  # exclude preview layer
             exclude.append(self._layer)
@@ -313,12 +310,6 @@ class Model(QObject, metaclass=PropertyMeta):
             self._layer = None
         self._doc.insert_layer(job.prompt, job.results[0], job.bounds)
 
-    def add_live_layer(self):
-        assert self._live_result is not None
-        self._doc.insert_layer(
-            f"[Live] {self.prompt}", self._live_result, Bounds(0, 0, *self._doc.extent)
-        )
-
     def set_workspace(self, workspace: Workspace):
         if self.workspace is Workspace.live:
             self.live.is_active = False
@@ -437,6 +428,11 @@ class LiveWorkspace(QObject, metaclass=PropertyMeta):
                 self.result = job.results[0]
             if self.is_active:
                 self._model.generate_live()
+
+    def copy_result_to_layer(self):
+        assert self.result is not None
+        doc = self._model.document
+        doc.insert_layer(f"[Live] {self._model.prompt}", self.result, Bounds(0, 0, *doc.extent))
 
     @property
     def result(self):

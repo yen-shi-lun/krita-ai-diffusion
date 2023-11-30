@@ -58,7 +58,6 @@ class LiveWidget(QWidget):
         self.apply_button.setAutoRaise(True)
         self.apply_button.setEnabled(False)
         self.apply_button.setToolTip("Copy the current result to the image as a new layer")
-        self.apply_button.clicked.connect(self.apply_result)
 
         self.style_select = StyleSelectWidget(self)
 
@@ -140,6 +139,7 @@ class LiveWidget(QWidget):
                 bind(model, "negative_prompt", self.negative_textbox, "text"),
                 model.live.is_active_changed.connect(self.update_is_active),
                 model.live.has_result_changed.connect(self.apply_button.setEnabled),
+                self.apply_button.clicked.connect(model.live.copy_result_to_layer),
                 self.add_control_button.clicked.connect(model.control.add),
                 self.random_seed_button.clicked.connect(model.live.generate_seed),
                 model.error_changed.connect(self.error_text.setText),
@@ -160,10 +160,6 @@ class LiveWidget(QWidget):
         self.active_button.setIcon(
             self._pause_icon if self.model.live.is_active else self._play_icon
         )
-
-    def apply_result(self):
-        if self.model.has_live_result:
-            self.model.add_live_layer()
 
     def show_result(self, image: Image):
         target = Extent.from_qsize(self.preview_area.size())
