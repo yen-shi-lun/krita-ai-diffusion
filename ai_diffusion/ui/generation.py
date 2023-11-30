@@ -1,5 +1,6 @@
 from __future__ import annotations
-from PyQt5.QtCore import QMetaObject
+from PyQt5.QtCore import Qt, QMetaObject, QSize
+from PyQt5.QtGui import QGuiApplication, QMouseEvent
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -7,10 +8,15 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QProgressBar,
     QLabel,
+    QListWidget,
     QListWidgetItem,
+    QListView,
+    QSizePolicy,
 )
 
 from ..properties import Binding, bind, Bind
+from ..image import Bounds
+from ..jobs import Job, JobQueue, JobState, JobKind
 from ..model import Model
 from ..root import root
 from ..settings import settings
@@ -22,9 +28,136 @@ from .widget import (
     StrengthWidget,
     ControlLayerButton,
     QueueWidget,
-    HistoryWidget,
     ControlListWidget,
 )
+
+
+class HistoryWidget(QListWidget):
+    _jobs: JobQueue
+    _connections: list[QMetaObject.Connection]
+    _last_prompt: str | None = None
+    _last_bounds: Bounds | None = None
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._jobs = JobQueue()
+        self._connections = []
+
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setResizeMode(QListView.Adjust)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFlow(QListView.LeftToRight)
+        self.setViewMode(QListWidget.IconMode)
+        self.setIconSize(QSize(96, 96))
+        self.itemClicked.connect(self.handle_preview_click)
+
+    @property
+    def jobs(self):
+        return self._jobs
+
+    @jobs.setter
+    def jobs(self, jobs: JobQueue):
+        Binding.disconnect_all(self._connections)
+        self._jobs = jobs
+        self._connections = [
+            jobs.selection_changed.connect(self.update_selection),
+            self.itemSelectionChanged.connect(self.select_item),
+            jobs.job_finished.connect(self.add),
+        ]
+        self.rebuild()
+        self.update_selection()
+
+    def add(self, job: Job):
+        if job.state is not JobState.finished or job.kind is not JobKind.diffusion:
+            return  # Only finished diffusion jobs have images to show
+        if self._last_prompt != job.prompt or self._last_bounds != job.bounds:
+            self._last_prompt = job.prompt
+            self._last_bounds = job.bounds
+            prompt = job.prompt if job.prompt != "" else "<no prompt>"
+
+            header = QListWidgetItem(f"{job.timestamp:%H:%M} - {prompt}")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setData(Qt.ItemDataRole.UserRole, job.id)
+            header.setData(Qt.ItemDataRole.ToolTipRole, job.prompt)
+            header.setSizeHint(QSize(800, self.fontMetrics().lineSpacing() + 4))
+            header.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
+            self.addItem(header)
+
+        for i, img in enumerate(job.results):
+            item = QListWidgetItem(img.to_icon(), None)  # type: ignore (text can be None)
+            item.setData(Qt.ItemDataRole.UserRole, job.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, i)
+            item.setData(
+                Qt.ItemDataRole.ToolTipRole,
+                f"{job.prompt}\nClick to toggle preview, double-click to apply.",
+            )
+            self.addItem(item)
+
+        scrollbar = self.verticalScrollBar()
+        if scrollbar.isVisible() and scrollbar.value() >= scrollbar.maximum() - 4:
+            self.scrollToBottom()
+
+    def update_selection(self):
+        selection = self._jobs.selection
+        if selection is None and len(self.selectedItems()) > 0:
+            self.clearSelection()
+        elif selection:
+            item = self._find(selection)
+            if item is not None and not item.isSelected():
+                item.setSelected(True)
+
+    def select_item(self):
+        items = self.selectedItems()
+        if len(items) > 0:
+            self._jobs.selection = self._item_data(items[0])
+        else:
+            self._jobs.selection = None
+
+    def is_finished(self, job: Job):
+        return job.kind is JobKind.diffusion and job.state is JobState.finished
+
+    def prune(self, jobs: JobQueue):
+        first_id = next((job.id for job in jobs if self.is_finished(job)), None)
+        while self.count() > 0 and self.item(0).data(Qt.ItemDataRole.UserRole) != first_id:
+            self.takeItem(0)
+
+    def rebuild(self):
+        self.clear()
+        for job in filter(self.is_finished, self._jobs):
+            self.add(job)
+
+    def item_info(self, item: QListWidgetItem) -> tuple[str, int]:  # job id, image index
+        return item.data(Qt.ItemDataRole.UserRole), item.data(Qt.ItemDataRole.UserRole + 1)
+
+    def handle_preview_click(self, item: QListWidgetItem):
+        if item.text() != "" and item.text() != "<no prompt>":
+            prompt = item.data(Qt.ItemDataRole.ToolTipRole)
+            QGuiApplication.clipboard().setText(prompt)
+
+    def mousePressEvent(self, e: QMouseEvent) -> None:
+        # make single click deselect current item (usually requires Ctrl+click)
+        mods = e.modifiers()
+        mods |= Qt.KeyboardModifier.ControlModifier
+        e = QMouseEvent(
+            e.type(),
+            e.localPos(),
+            e.windowPos(),
+            e.screenPos(),
+            e.button(),
+            e.buttons(),
+            mods,
+            e.source(),
+        )
+        return super().mousePressEvent(e)
+
+    def _find(self, id: JobQueue.Item):
+        items = (self.item(i) for i in range(self.count()))
+        return next((item for item in items if self._item_data(item) == id), None)
+
+    def _item_data(self, item: QListWidgetItem):
+        return JobQueue.Item(
+            item.data(Qt.ItemDataRole.UserRole), item.data(Qt.ItemDataRole.UserRole + 1)
+        )
 
 
 class GenerationWidget(QWidget):
@@ -51,11 +184,9 @@ class GenerationWidget(QWidget):
 
         self.prompt_textbox = TextPromptWidget(parent=self)
         self.prompt_textbox.line_count = settings.prompt_line_count
-        self.prompt_textbox.activated.connect(self.generate)
 
         self.negative_textbox = TextPromptWidget(line_count=1, is_negative=True, parent=self)
         self.negative_textbox.setVisible(settings.show_negative_prompt)
-        self.negative_textbox.activated.connect(self.generate)
 
         prompt_layout = QVBoxLayout()
         prompt_layout.setContentsMargins(0, 0, 0, 0)
@@ -68,9 +199,7 @@ class GenerationWidget(QWidget):
         layout.addWidget(self.control_list)
 
         self.strength_slider = StrengthWidget(parent=self)
-
         self.add_control_button = ControlLayerButton(self)
-
         strength_layout = QHBoxLayout()
         strength_layout.addWidget(self.strength_slider)
         strength_layout.addWidget(self.add_control_button)
@@ -78,10 +207,7 @@ class GenerationWidget(QWidget):
 
         self.generate_button = QPushButton("Generate", self)
         self.generate_button.setMinimumHeight(int(self.generate_button.sizeHint().height() * 1.2))
-        self.generate_button.clicked.connect(self.generate)
-
         self.queue_button = QueueWidget(self)
-
         actions_layout = QHBoxLayout()
         actions_layout.addWidget(self.generate_button)
         actions_layout.addWidget(self.queue_button)
@@ -128,6 +254,9 @@ class GenerationWidget(QWidget):
                 model.has_error_changed.connect(self.error_text.setVisible),
                 model.can_apply_result_changed.connect(self.apply_button.setEnabled),
                 self.add_control_button.clicked.connect(model.control.add),
+                self.prompt_textbox.activated.connect(model.generate),
+                self.negative_textbox.activated.connect(model.generate),
+                self.generate_button.clicked.connect(model.generate),
             ]
             self.control_list.model = model
             self.queue_button.jobs = model.jobs
@@ -143,17 +272,10 @@ class GenerationWidget(QWidget):
             self.negative_textbox.text = ""
             self.negative_textbox.setVisible(value)
 
-    def generate(self):
-        self.model.generate()
-        self.update()
-
-    def show_preview(self, item: QListWidgetItem):
-        job_id, index = self.history.item_info(item)
-        self.model.show_preview(job_id, index)
-
     def apply_selected_result(self):
-        self.model.apply_current_result()
+        self.model.apply_result()
 
     def apply_result(self, item: QListWidgetItem):
-        self.show_preview(item)
-        self.apply_selected_result()
+        job_id, index = self.history.item_info(item)
+        self.model.jobs.select(job_id, index)
+        self.model.apply_result()

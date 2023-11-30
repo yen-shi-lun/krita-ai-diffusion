@@ -285,12 +285,12 @@ class Model(QObject, metaclass=PropertyMeta):
         if self._layer is not None:
             self._doc.hide_layer(self._layer)
 
-    def apply_current_result(self):
-        """Promote the preview layer to a user layer."""
+    def apply_result(self):
         assert self._layer and self.can_apply_result
         self._layer.setLocked(False)
         self._layer.setName(self._layer.name().replace("[Preview]", "[Generated]"))
         self._layer = None
+        self.jobs.selection = None
 
     def add_control_layer(self, job: Job, result: dict | None):
         assert job.kind is JobKind.control_layer and job.control
