@@ -3,15 +3,17 @@ import asyncio
 import random
 from enum import Enum
 from typing import NamedTuple, cast
-from PyQt5.QtCore import Qt, QObject, QUuid, pyqtSignal
+from PyQt5.QtCore import QObject, pyqtSignal
 
-from . import eventloop, workflow, NetworkError, settings, util
+from . import eventloop, workflow, util
+from .settings import settings
+from .network import NetworkError
 from .image import Extent, Image, ImageCollection, Mask, Bounds
-from .client import ClientMessage, ClientEvent, filter_supported_styles, resolve_sd_version
+from .client import ClientMessage, ClientEvent, filter_supported_styles
 from .document import Document, LayerObserver
 from .pose import Pose
 from .style import Style, Styles
-from .workflow import Control, ControlMode, Conditioning, LiveParams
+from .workflow import ControlMode, Conditioning, LiveParams
 from .connection import Connection, ConnectionState
 from .properties import Property, PropertyMeta
 from .jobs import Job, JobKind, JobQueue, JobState
@@ -37,8 +39,6 @@ class Model(QObject, metaclass=PropertyMeta):
     _live_result: Image | None = None
     _image_layers: LayerObserver
 
-    has_error_changed = pyqtSignal(bool)
-
     workspace = Property(Workspace.generation, setter="set_workspace")
     style = Property(Styles.list().default)
     prompt = Property("")
@@ -51,8 +51,17 @@ class Model(QObject, metaclass=PropertyMeta):
     jobs: JobQueue
     error = Property("")
     can_apply_result = Property(False)
-
     task: asyncio.Task | None = None
+
+    workspace_changed = pyqtSignal(Workspace)
+    style_changed = pyqtSignal(Style)
+    prompt_changed = pyqtSignal(str)
+    negative_prompt_changed = pyqtSignal(str)
+    strength_changed = pyqtSignal(float)
+    progress_changed = pyqtSignal(float)
+    error_changed = pyqtSignal(str)
+    can_apply_result_changed = pyqtSignal(bool)
+    has_error_changed = pyqtSignal(bool)
 
     def __init__(self, document: Document, connection: Connection):
         super().__init__()
@@ -360,6 +369,12 @@ class UpscaleWorkspace(QObject, metaclass=PropertyMeta):
     strength = Property(0.3)
     target_extent = Property(Extent(1, 1))
 
+    upscaler_changed = pyqtSignal(str)
+    factor_changed = pyqtSignal(float)
+    use_diffusion_changed = pyqtSignal(bool)
+    strength_changed = pyqtSignal(float)
+    target_extent_changed = pyqtSignal(Extent)
+
     _model: Model
 
     def __init__(self, model: Model):
@@ -391,6 +406,10 @@ class LiveWorkspace(QObject, metaclass=PropertyMeta):
     seed = Property(0)
     has_result = Property(False)
 
+    is_active_changed = pyqtSignal(bool)
+    strength_changed = pyqtSignal(float)
+    seed_changed = pyqtSignal(int)
+    has_result_changed = pyqtSignal(bool)
     result_available = pyqtSignal(Image)
 
     _model: Model

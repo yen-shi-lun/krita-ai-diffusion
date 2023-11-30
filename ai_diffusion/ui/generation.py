@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import (
 
 from ..properties import Binding, bind, Bind
 from ..model import Model
-from .. import root, settings
+from ..root import root
+from ..settings import settings
 from . import theme
 from .widget import (
     WorkspaceSelectWidget,

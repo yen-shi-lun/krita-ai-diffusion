@@ -1,7 +1,9 @@
 from __future__ import annotations
 from PyQt5.QtCore import QObject, pyqtSignal, QUuid, Qt
 
-from . import model, jobs, ControlMode, settings
+from . import model, jobs
+from .settings import settings
+from .resources import ControlMode
 from .client import resolve_sd_version
 from .properties import Property, PropertyMeta
 from .image import Bounds
@@ -11,7 +13,7 @@ from .workflow import Control
 class ControlLayer(QObject, metaclass=PropertyMeta):
     mode = Property(ControlMode.image)
     layer_id = Property(QUuid())
-    strength = Property(1.0)
+    strength = Property(100)
     end = Property(1.0)
     is_supported = Property(True)
     is_pose_vector = Property(False)
@@ -20,11 +22,22 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
     show_end = Property(False)
     error_text = Property("")
 
+    mode_changed = pyqtSignal(ControlMode)
+    layer_id_changed = pyqtSignal(QUuid)
+    strength_changed = pyqtSignal(int)
+    end_changed = pyqtSignal(float)
+    is_supported_changed = pyqtSignal(bool)
+    is_pose_vector_changed = pyqtSignal(bool)
+    can_generate_changed = pyqtSignal(bool)
+    has_active_job_changed = pyqtSignal(bool)
+    show_end_changed = pyqtSignal(bool)
+    error_text_changed = pyqtSignal(str)
+
     _model: model.Model
     _generate_job: jobs.Job | None = None
 
     def __init__(self, model: model.Model, mode: ControlMode, layer_id: QUuid):
-        from . import root
+        from .root import root
 
         super().__init__()
         self._model = model
@@ -54,14 +67,14 @@ class ControlLayer(QObject, metaclass=PropertyMeta):
         image = self._model.document.get_layer_image(layer, bounds)
         if self.mode.is_lines or self.mode is ControlMode.stencil:
             image.make_opaque(background=Qt.GlobalColor.white)
-        return Control(self.mode, image, self.strength, self.end)
+        return Control(self.mode, image, self.strength / 100, self.end)
 
     def generate(self):
         self._generate_job = self._model.generate_control_layer(self)
         self.has_active_job = True
 
     def _update_is_supported(self):
-        from . import root
+        from .root import root
 
         is_supported = True
         if client := root.connection.client_if_connected:

@@ -6,7 +6,8 @@ from typing import Deque, NamedTuple
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .image import Bounds, ImageCollection
-from . import control, settings
+from .settings import settings
+from . import control
 
 
 class JobState(Flag):

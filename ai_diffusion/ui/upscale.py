@@ -12,10 +12,10 @@ from PyQt5.QtWidgets import (
     QGroupBox,
 )
 
-from ..properties import Binding, bind, bind_combo, bind_widget, Bind
+from ..properties import Binding, bind, bind_combo, Bind
 from ..resources import UpscalerName
 from ..model import Model
-from .. import root
+from ..root import root
 from .theme import SignalBlocker
 from .widget import WorkspaceSelectWidget, StyleSelectWidget, StrengthWidget, QueueWidget
 
@@ -120,11 +120,9 @@ class UpscaleWidget(QWidget):
                 bind_combo(model.upscale, "upscaler", self.model_select),
                 model.upscale.factor_changed.connect(self.update_factor),
                 model.upscale.target_extent_changed.connect(self.update_target_extent),
-                bind_widget(
-                    model.upscale,
-                    "use_diffusion",
-                    self.refinement_checkbox.toggled,
-                    self.refinement_checkbox.setChecked,
+                model.upscale.use_diffusion_changed.connect(self.refinement_checkbox.setChecked),
+                self.refinement_checkbox.toggled.connect(
+                    lambda x: setattr(model.upscale, "use_diffusion", x)
                 ),
                 bind(model, "style", self.style_select, "value"),
                 bind(model.upscale, "strength", self.strength_slider, "value"),

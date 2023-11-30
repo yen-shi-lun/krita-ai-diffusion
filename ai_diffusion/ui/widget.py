@@ -24,11 +24,17 @@ from PyQt5.QtGui import QColor, QFontMetrics, QGuiApplication, QKeyEvent, QMouse
 from PyQt5.QtCore import Qt, QMetaObject, QSize, pyqtSignal
 import krita
 
-from .. import ControlMode, Style, Styles, Bounds, client, root
-from . import actions, SignalBlocker, SettingsDialog, theme
-from ..properties import Binding, Bind, bind, bind_combo, bind_widget
+from ..style import Style, Styles
+from ..image import Bounds
+from ..resources import ControlMode
+from ..root import root
+from ..client import filter_supported_styles, resolve_sd_version
+from ..properties import Binding, bind, bind_combo
 from ..jobs import Job, JobKind, JobState, JobQueue
 from ..model import Model, Workspace, ControlLayer
+from .settings import SettingsDialog
+from .theme import SignalBlocker
+from . import actions, theme
 
 
 class QueueWidget(QToolButton):
@@ -135,15 +141,14 @@ class ControlWidget(QWidget):
         self.strength_spin.setSuffix("%")
         self.strength_spin.setSingleStep(10)
         self.strength_spin.setToolTip("Control strength")
-        self.strength_spin.valueChanged.connect(lambda x: setattr(control, "strength", x / 100))
-        control.strength_changed.connect(lambda x: self.strength_spin.setValue(int(x * 100)))
+        bind(control, "strength", self.strength_spin, "value")
 
         self.end_spin = QDoubleSpinBox(self)
         self.end_spin.setRange(0.0, 1.0)
         self.end_spin.setValue(control.end)
         self.end_spin.setSingleStep(0.1)
         self.end_spin.setToolTip("Control ending step ratio")
-        bind_widget(control, "end", self.end_spin.valueChanged, self.end_spin.setValue)
+        bind(control, "end", self.end_spin, "value")
 
         self.error_text = QLabel(self)
         self.error_text.setStyleSheet(f"color: {theme.red};")
@@ -437,19 +442,18 @@ class StyleSelectWidget(QWidget):
 
     def update_styles(self):
         comfy = root.connection.client_if_connected
-        self._styles = client.filter_supported_styles(Styles.list(), comfy)
-        self._combo.blockSignals(True)
-        self._combo.clear()
-        for style in self._styles:
-            icon = theme.sd_version_icon(client.resolve_sd_version(style, comfy))
-            self._combo.addItem(icon, style.name, style.filename)
-        if self._value in self._styles:
-            self._combo.setCurrentText(self._value.name)
-        elif len(self._styles) > 0:
-            self._value = self._styles[0]
-            self._combo.setCurrentIndex(0)
-            self.value_changed.emit(self._value)
-        self._combo.blockSignals(False)
+        self._styles = filter_supported_styles(Styles.list(), comfy)
+        with SignalBlocker(self._combo):
+            self._combo.clear()
+            for style in self._styles:
+                icon = theme.sd_version_icon(resolve_sd_version(style, comfy))
+                self._combo.addItem(icon, style.name, style.filename)
+            if self._value in self._styles:
+                self._combo.setCurrentText(self._value.name)
+            elif len(self._styles) > 0:
+                self._value = self._styles[0]
+                self._combo.setCurrentIndex(0)
+                self.value_changed.emit(self._value)
 
     def change_style(self):
         style = self._styles[self._combo.currentIndex()]

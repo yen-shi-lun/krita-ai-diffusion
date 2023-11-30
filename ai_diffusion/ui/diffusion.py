@@ -5,7 +5,8 @@ from krita import Krita, DockWidget
 from ..model import Model, Workspace
 from ..server import Server
 from ..connection import ConnectionState
-from .. import ServerMode, root, settings
+from ..settings import ServerMode, settings
+from ..root import root
 from . import theme
 from .generation import GenerationWidget
 from .upscale import UpscaleWidget

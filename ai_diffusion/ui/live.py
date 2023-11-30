@@ -10,10 +10,11 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
 )
 
-from ..properties import Binding, bind, bind_widget, Bind
+from ..properties import Binding, bind, Bind
 from ..image import Extent, Image
 from ..model import Model
-from .. import root, settings
+from ..root import root
+from ..settings import settings
 from .widget import (
     WorkspaceSelectWidget,
     StyleSelectWidget,
@@ -134,9 +135,7 @@ class LiveWidget(QWidget):
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
                 bind(model, "style", self.style_select, "value"),
                 bind(model.live, "strength", self.strength_slider, "value"),
-                bind_widget(
-                    model.live, "seed", self.seed_input.valueChanged, self.seed_input.setValue
-                ),
+                bind(model.live, "seed", self.seed_input, "value"),
                 bind(model, "prompt", self.prompt_textbox, "text"),
                 bind(model, "negative_prompt", self.negative_textbox, "text"),
                 model.live.is_active_changed.connect(self.update_is_active),
