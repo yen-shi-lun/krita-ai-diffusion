@@ -1,4 +1,4 @@
-name: Run installer and basic tests (no diffusion)
+name: Lint, Typecheck and Test
 on: [push, pull_request]
 
 jobs:
@@ -30,8 +30,13 @@ jobs:
           cache: 'pip'
       - name: Dependencies
         run: pip install -r requirements.txt
+      - name: Cache models
+        uses: actions/cache@v3
+        with:
+          path: script/docker/downloads
+          key: models-v1
       - name: Download models
-        run: python scripts/download_models.py --minimal script/docker
+        run: python scripts/download_models.py --minimal script/docker/downloads
       - name: Test installer
         run: python -m pytest tests/test_server.py -vs --test-install
       - name: Test
