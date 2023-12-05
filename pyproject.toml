@@ -1,6 +1,8 @@
 [tool.black]
 line-length=100
 preview=1
+include='(ai_diffusion|scripts|tests)/.*\.pyi?$'
+extend-exclude='websockets|krita\.pyi$'
 
 [tool.pyright]
 include = [
