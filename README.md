@@ -1,6 +1,6 @@
 <h1><img width="64px" src="ai_diffusion/icons/logo-128.png"> Generative AI <i>for Krita</i></h1>
 
-[Features](#features) | [Download](https://github.com/Acly/krita-ai-diffusion/releases/latest) | [Installation](#installation) | [Video](https://youtu.be/Ly6USRwTHe0) | [Screenshots](#screenshots)
+[Features](#features) | [⭳ Download](https://github.com/Acly/krita-ai-diffusion/releases/latest) | [Installation](#installation) | <img src="https://cdn.simpleicons.org/youtube" alt="YT" width=20 height=20 valign=top /> [Video](https://youtu.be/Ly6USRwTHe0) | [Screenshots](#screenshots) | <img height="20" width="20" valign=top src="https://cdn.simpleicons.org/discord" /> Discord
 
 Generate images from within Krita with minimal fuss: Select an area, push a button,
 and new content that matches your image will be generated. Or expand your canvas and
@@ -13,7 +13,7 @@ Powerful customization is available for advanced users.
 
 _Local. Open source. Free._
 
-[![Watch video demo](media/screenshot-1.png)](https://youtu.be/Ly6USRwTHe0 "Watch video demo")
+[![Watch video demo](media/screenshot-video-preview.webp)](https://youtu.be/Ly6USRwTHe0 "Watch video demo")
 
 ## <a name="features"></a> Features
 
